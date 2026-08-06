@@ -28,7 +28,16 @@ Validated live on Blender 5.2 LTS + TD 2025.33070 (Windows, RTX 3090):
 - `bpy.app.timers` racing timeline playback causes **flicker** while playing
   → apply via frame handlers instead (Phase 1, the core fix)
 
-## Phase 1 — Seamless playback (the flicker fix) ← NEXT
+## Phase 1 — Seamless playback (the flicker fix) — DONE (2026-08-06)
+
+All four items implemented on `phase1-seamless-playback`; live-tested
+end-to-end (TD 60 fps, full loop verified). Extras forced by live testing:
+EEVEE offscreen capture moved into a View3D draw callback (timer-context
+captures segfault in Blender 5.x), script re-runs tear down the previous
+instance, and the TD sender backs off reconnects so a dead Blender no longer
+stalls TD's frame loop (~2 fps -> 60). Remaining before merge: visual flicker
+acceptance (paused/playing/scrubbing, RENDERED viewport).
+
 
 The current timer applies data ~60×/s independent of Blender's own frame
 loop. During playback, animation evaluation and the timer both write state →
