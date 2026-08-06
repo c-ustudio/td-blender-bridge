@@ -95,9 +95,11 @@ class _State:
         self.xforms = {}   # name -> (vals16, camdict|None)
         self.params = {}   # (name, path) -> value
         self.geo = {}      # name -> dict(kind=, pos=bytes, tris=bytes|None, n=, ncol=)
+        self.tex = {}      # name -> dict(w=, h=, px=bytes)  (kind 4 images)
         self.dirty_x = set()
         self.dirty_p = set()
         self.dirty_g = set()
+        self.dirty_t = set()
         # stats
         self.pkts = 0
         self.pps = 0.0
@@ -189,15 +191,31 @@ def _handle_tcp_frame(payload):
             g = _parse_points(body, kind)
         elif kind == 2:        # mesh
             g = _parse_mesh(body, ver)
+        elif kind == 4:        # image
+            g = _parse_image(body)
         else:
             return
     except (struct.error, ValueError):
         return
     with S.lock:
-        S.geo[name] = g
-        S.dirty_g.add(name)
+        if kind == 4:
+            S.tex[name] = g
+            S.dirty_t.add(name)
+        else:
+            S.geo[name] = g
+            S.dirty_g.add(name)
         S.pkts += 1
         S._pps_n += 1
+
+
+def _parse_image(body):
+    fmt, w, h = struct.unpack_from("<BHH", body, 0)
+    if fmt != 1:
+        raise ValueError("unsupported image format %d" % fmt)
+    px = body[5:5 + w * h * 4]
+    if len(px) < w * h * 4:
+        raise ValueError("short frame")
+    return {"w": w, "h": h, "px": px}
 
 
 def _parse_points(body, kind):
@@ -592,6 +610,21 @@ def _update_geo(name):
                     "uv", np.ascontiguousarray(uv[tris.ravel()]).ravel())
 
 
+def _update_tex(name, t):
+    """kind-4 image -> Blender image datablock (reference it by name in any
+    Image Texture shader node)."""
+    w, h = t["w"], t["h"]
+    img = bpy.data.images.get(name)
+    if img is None:
+        img = bpy.data.images.new(name, w, h, alpha=True)
+    if img.size[0] != w or img.size[1] != h:
+        img.scale(w, h)
+    px = np.frombuffer(t["px"], dtype=np.uint8).astype(np.float32)
+    px *= 1.0 / 255.0
+    img.pixels.foreach_set(px)
+    img.update()
+
+
 def _set_point_attr(me, name, dtype, key, n, data):
     attr = me.attributes.get(name)
     if attr is None or attr.data_type != dtype or len(attr.data) != n:
@@ -661,16 +694,18 @@ def _apply_latest():
         dx = {n: S.xforms[n] for n in S.dirty_x}
         dp = {k: S.params[k] for k in S.dirty_p}
         dg = set(S.dirty_g)
+        dt = {n: S.tex[n] for n in S.dirty_t}
         S.dirty_x.clear()
         S.dirty_p.clear()
         S.dirty_g.clear()
+        S.dirty_t.clear()
         now = time.time()
         if now - S._pps_t >= 1.0:
             S.pps = S._pps_n / (now - S._pps_t)
             S._pps_n = 0
             S._pps_t = now
 
-    changed = bool(dx or dp or dg)
+    changed = bool(dx or dp or dg or dt)
     if changed:
         try:
             scene = bpy.context.scene
@@ -688,6 +723,8 @@ def _apply_latest():
                 _set_param(name, path, v)
             for name in dg:
                 _update_geo(name)
+            for name, t in dt.items():
+                _update_tex(name, t)
         except Exception as e:
             S.last_error = str(e)
 

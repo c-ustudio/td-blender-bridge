@@ -92,10 +92,15 @@ Implemented on `phase2-geometry` as protocol v2 (v1 still parses):
 - Spout backend on Windows (zero-copy GPU, same-GPU only) with TCP as
   portable/cross-machine fallback; requires the OpenGL backend in Blender
 - Latency budget & measurement (target < 3 frames end-to-end)
-- TOP -> Blender textures: stream TD TOPs into Blender image datablocks
-  (drive materials/world from TD; mirror of the frame server)
-- POP direct readback: today POPs work via POP->CHOP (tx/ty/tz...);
-  investigate reading POP buffers directly to skip the CHOP hop
+- ~~TOP -> Blender textures~~ implemented 2026-08-06 (kind-4 frames,
+  `TOP_OPS` / component Textop par -> Blender image datablock; pending
+  live validation)
+- ~~POP support~~ resolved 2026-08-06: POP attribute `.vals()` is Python
+  lists (no bulk numpy on POPs), so `poptoCHOP` + `numpyArray()` IS the
+  fast path (measured sub-ms). Sender now accepts POP-style channel
+  names (`P_0/P_1/P_2`, `Color_0..3`, `N_0..`, `v_0..`, `pscale`,
+  `UV_0/1`) alongside SOP-to-CHOP names - wire POP -> poptoCHOP ->
+  Points/Instances par, no renaming
 - Optional depth/AOV passes for TD-side compositing
 
 ## Phase 4 — Packaging & DX

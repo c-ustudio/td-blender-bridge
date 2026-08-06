@@ -62,6 +62,7 @@ Version 2 (current). Bit 7 of `kind` set ⇒ `body` is zlib-compressed
 | 1 points | `u32 count, u8 flags, count*3 f32 xyz, [blocks]` |
 | 2 mesh | `u32 nverts, u32 ntris, u8 flags(v2 only), verts, tris, [blocks]` |
 | 3 instances | identical to kind 1; Blender adds a "TDB Instances" GN modifier (instance any object on the transforms) |
+| 4 image | `u8 fmt(1=RGBA8), u16 w, u16 h, w*h*4 pixels (bottom-up)` → Blender image datablock named after the stream (use in any Image Texture node) |
 
 Points/instances flag bits, optional blocks in this order:
 

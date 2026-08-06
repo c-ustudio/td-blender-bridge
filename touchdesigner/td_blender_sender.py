@@ -75,8 +75,15 @@ INSTANCE_OPS = {
     # 'sopto_instances': 'TD_Instances',
 }
 
-# protocol version: 2 adds per-point vel/scale/rot, mesh normals/UVs and
-# compression. Set to 1 when talking to a v0.2 Blender add-on.
+# textures: TOP -> Blender image datablock (referenced by name in shaders
+# via an Image Texture node). Heavy for large TOPs - one CPU readback per
+# frame; keep control textures small.
+TOP_OPS = {
+    # 'noise1': 'TD_Tex',
+}
+
+# protocol version: 2 adds per-point vel/scale/rot, mesh normals/UVs,
+# textures and compression. Set to 1 when talking to a v0.2 Blender add-on.
 PROTOCOL = 2
 # zlib-compress (level 1) geometry bodies larger than this; None disables.
 COMPRESS_MIN = 512 * 1024
@@ -242,35 +249,43 @@ def _chop_arrays(chop):
     def idx(n):
         return names.index(n) if n in names else None
 
-    def vec(chans):
-        ids = [idx(c) for c in chans]
-        if any(i is None for i in ids):
-            return None
-        return np.ascontiguousarray(arr[ids].T.astype(np.float32))
+    def vec(*alternatives):
+        """First alternative whose channels all exist. Accepts both SOP-to-
+        CHOP names (tx ty tz, cr cg cb...) and POP-to-CHOP names (P_0 P_1
+        P_2, Color_0...)."""
+        for chans in alternatives:
+            ids = [idx(c) for c in chans]
+            if not any(i is None for i in ids):
+                return np.ascontiguousarray(arr[ids].T.astype(np.float32))
+        return None
 
-    pos = vec(('tx', 'ty', 'tz'))
+    pos = vec(('tx', 'ty', 'tz'), ('P_0', 'P_1', 'P_2'))
     if pos is None:
         return None
     out = {'pos': pos}
-    rgb = vec(('cr', 'cg', 'cb'))
+    rgb = vec(('cr', 'cg', 'cb'), ('Color_0', 'Color_1', 'Color_2'))
     if rgb is not None:
         ia = idx('ca')
+        if ia is None:
+            ia = idx('Color_3')
         a = (arr[ia].astype(np.float32) if ia is not None
              else np.ones(arr.shape[1], np.float32))
         out['col'] = np.ascontiguousarray(
             np.concatenate([rgb, a[:, None]], axis=1).astype(np.float32))
-    out['vel'] = vec(('vx', 'vy', 'vz'))
-    out['scale'] = vec(('sx', 'sy', 'sz'))
-    rot = vec(('rx', 'ry', 'rz'))
+    out['vel'] = vec(('vx', 'vy', 'vz'), ('v_0', 'v_1', 'v_2'),
+                     ('V_0', 'V_1', 'V_2'))
+    scale = vec(('sx', 'sy', 'sz'), ('Scale_0', 'Scale_1', 'Scale_2'))
+    if scale is None:
+        ps = idx('pscale')          # uniform scale broadcast to xyz
+        if ps is not None:
+            s1 = arr[ps].astype(np.float32)
+            scale = np.ascontiguousarray(np.repeat(s1[:, None], 3, axis=1))
+    out['scale'] = scale
+    rot = vec(('rx', 'ry', 'rz'), ('Rot_0', 'Rot_1', 'Rot_2'))
     out['rot'] = _euler_deg_to_quat(rot) if rot is not None else None
-    nrm = vec(('nx', 'ny', 'nz'))
-    if nrm is None:
-        nrm = vec(('N(0)', 'N(1)', 'N(2)'))
-    out['nrm'] = nrm
-    uv = vec(('u', 'v'))
-    if uv is None:
-        uv = vec(('uv(0)', 'uv(1)'))
-    out['uv'] = uv
+    out['nrm'] = vec(('nx', 'ny', 'nz'), ('N(0)', 'N(1)', 'N(2)'),
+                     ('N_0', 'N_1', 'N_2'))
+    out['uv'] = vec(('u', 'v'), ('uv(0)', 'uv(1)'), ('UV_0', 'UV_1'))
     return out
 
 
@@ -316,6 +331,23 @@ def send_points(td_path, bl_name, kind=1):
 
 def send_instances(td_path, bl_name):
     send_points(td_path, bl_name, kind=3)
+
+
+def send_top(td_path, bl_name):
+    """Stream a TOP into a Blender image datablock (kind 4, RGBA8)."""
+    if PROTOCOL < 2:
+        return
+    o = op(td_path)
+    if o is None or o.family != 'TOP':
+        return
+    import numpy as np
+    arr = o.numpyArray(delayed=True)   # (h, w, 4) float32, bottom-up
+    if arr is None:
+        return
+    h, w = arr.shape[0], arr.shape[1]
+    px = np.clip(arr * 255.0, 0.0, 255.0).astype(np.uint8)
+    body = struct.pack('<BHH', 1, w, h) + px.tobytes()
+    _net.send_frame(4, bl_name, body)
 
 
 def _sop_triangles(sop):
@@ -414,3 +446,5 @@ def tick():
         _safe(send_instances, td_path, bl_name)
     for td_path, bl_name in MESH_SOPS.items():
         _safe(send_mesh, td_path, bl_name)
+    for td_path, bl_name in TOP_OPS.items():
+        _safe(send_top, td_path, bl_name)
