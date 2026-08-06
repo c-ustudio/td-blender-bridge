@@ -54,13 +54,32 @@ Length-prefixed frames on a persistent connection:
 payload := "TDBG" u8 version u8 kind u16 name_len name(utf8) body
 ```
 
+Version 2 (current). Bit 7 of `kind` set ⇒ `body` is zlib-compressed
+(deflate); low 7 bits are the kind.
+
 | kind | body |
 |---|---|
-| 1 points | `u32 count, u8 has_color, count*3 f32 xyz [, count*4 f32 rgba]` |
-| 2 mesh | `u32 nverts, u32 ntris, nverts*3 f32 xyz, ntris*3 u32 indices` |
+| 1 points | `u32 count, u8 flags, count*3 f32 xyz, [blocks]` |
+| 2 mesh | `u32 nverts, u32 ntris, u8 flags(v2 only), verts, tris, [blocks]` |
+| 3 instances | identical to kind 1; Blender adds a "TDB Instances" GN modifier (instance any object on the transforms) |
 
-Positions are in TD space (converted on the Blender side with numpy).
-Colors land in a `td_color` FLOAT_COLOR point attribute.
+Points/instances flag bits, optional blocks in this order:
+
+| bit | block | Blender attribute |
+|---|---|---|
+| 1 | `count*4 f32 rgba` | `td_color` FLOAT_COLOR |
+| 2 | `count*3 f32` velocity | `td_velocity` FLOAT_VECTOR |
+| 4 | `count*3 f32` scale | `td_scale` FLOAT_VECTOR |
+| 8 | `count*4 f32` quaternions (w,x,y,z) | `td_rot` QUATERNION |
+
+Mesh flag bits: 1 ⇒ `nverts*3 f32` per-vertex normals (custom split
+normals), 2 ⇒ `nverts*2 f32` UVs (`td_uv` layer, per-corner from vertex).
+
+v1 compatibility: points' `has_color` byte is flag bit 1, so v1 points
+parse as v2; v1 meshes have no flags byte (keyed on the version field).
+
+Positions/velocities/normals are in TD space (y-up, converted Blender-side);
+scale swaps y/z; quaternions swizzle `(w,x,y,z) → (w,x,-z,y)`.
 Mesh topology is rebuilt only when vert/tri counts change; otherwise only
 positions are updated (fast path).
 

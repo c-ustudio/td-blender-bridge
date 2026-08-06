@@ -67,14 +67,20 @@ Acceptance: TD playing at 60 fps, Blender viewport RENDERED — no flicker
 with timeline paused, playing, or scrubbing; camera path identical in all
 three states.
 
-## Phase 2 — Geometry & scale
+## Phase 2 — Geometry & scale — DONE (2026-08-06)
 
-- Per-point attributes beyond color (velocity → motion blur vectors, scale,
-  rotation for instancing)
-- Instance streaming: N transforms → GN instances (cheaper than meshes)
-- Normals/UVs on meshes (optional channels in the TDBG frame)
-- Chunked/partial mesh updates; >1M-point stress test; zstd option
-- Auto Geometry Nodes setup on first arrival of a points object
+Implemented on `phase2-geometry` as protocol v2 (v1 still parses):
+
+- ✅ Per-point attributes: velocity/scale/rotation → `td_velocity`,
+  `td_scale`, `td_rot` (quaternion) point attributes
+- ✅ Instance streaming: kind-3 frames → "TDB Instances" GN modifier
+  (instance any object on N streamed transforms, sphere fallback)
+- ✅ Normals/UVs on meshes (optional flags in the TDBG frame)
+- ✅ Compression: zlib level 1 (stdlib on both sides — no zstd dependency)
+  auto-applied over 512 KB; `tools/stress_test.py` for the 1M-point test
+- ✅ Auto Geometry Nodes setup for points (spheres + td_color material)
+- Deferred: chunked/partial mesh updates — revisit if a real bottleneck
+  shows; TCP framing + compression cover current sizes
 
 ## Phase 3 — Frames back to TD, properly
 

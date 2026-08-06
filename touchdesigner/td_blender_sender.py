@@ -30,6 +30,7 @@ import socket
 import struct
 import math
 import time
+import zlib
 
 # ----------------------------- CONFIG ---------------------------------------
 
@@ -56,11 +57,29 @@ PARAM_MAP = {
 }
 
 # point clouds: op -> Blender object name.
-# op can be a SOP-to-CHOP (fast, recommended: channels tx ty tz [cr cg cb ca])
-# or a SOP (slow python fallback).
+# op can be a SOP-to-CHOP (fast, recommended) or a SOP (slow python fallback).
+# Recognized CHOP channels (all optional except tx ty tz):
+#   tx ty tz               positions
+#   cr cg cb [ca]          color        -> td_color attribute
+#   vx vy vz               velocity     -> td_velocity (motion blur vectors)
+#   sx sy sz               scale        -> td_scale    (instancing)
+#   rx ry rz (degrees)     rotation     -> td_rot      (instancing)
 POINT_OPS = {
     # 'sopto_points': 'TD_Points',
 }
+
+# instance transforms: SOP-to-CHOP (same channels as POINT_OPS) -> Blender
+# object. Arrives as points with td_scale/td_rot; Blender auto-adds a
+# "TDB Instances" GN modifier - pick any object to instance in its UI.
+INSTANCE_OPS = {
+    # 'sopto_instances': 'TD_Instances',
+}
+
+# protocol version: 2 adds per-point vel/scale/rot, mesh normals/UVs and
+# compression. Set to 1 when talking to a v0.2 Blender add-on.
+PROTOCOL = 2
+# zlib-compress (level 1) geometry bodies larger than this; None disables.
+COMPRESS_MIN = 512 * 1024
 
 # meshes: SOP (triangulate with a Convert SOP first) -> Blender object name
 MESH_SOPS = {
@@ -96,8 +115,13 @@ class _Net:
             pass
 
     def send_frame(self, kind, name, body):
+        if (PROTOCOL >= 2 and COMPRESS_MIN is not None
+                and len(body) >= COMPRESS_MIN):
+            body = zlib.compress(body, 1)
+            kind |= 0x80
         nm = name.encode()
-        payload = b'TDBG' + bytes([1, kind]) + struct.pack('<H', len(nm)) + nm + body
+        payload = (b'TDBG' + bytes([PROTOCOL, kind])
+                   + struct.pack('<H', len(nm)) + nm + body)
         data = struct.pack('<I', len(payload)) + payload
         for attempt in range(2):
             if self.tcp is None:
@@ -192,40 +216,94 @@ def send_params():
         _net.send_json({'t': 'params', 'd': batch})
 
 
-def _positions_from_chop(chop):
-    """(N,3) float32 positions + optional (N,4) colors from a SOP-to-CHOP."""
+def _euler_deg_to_quat(e):
+    """(N,3) XYZ euler degrees (TD default Rx Ry Rz order) -> (N,4) quats
+    (w,x,y,z), vectorized. R = Rz @ Ry @ Rx."""
+    import numpy as np
+    h = np.radians(e.astype(np.float64)) * 0.5
+    cx, sx = np.cos(h[:, 0]), np.sin(h[:, 0])
+    cy, sy = np.cos(h[:, 1]), np.sin(h[:, 1])
+    cz, sz = np.cos(h[:, 2]), np.sin(h[:, 2])
+    w1, x1, y1, z1 = cy * cx, cy * sx, sy * cx, -sy * sx   # qy * qx
+    return np.ascontiguousarray(np.stack([
+        cz * w1 - sz * z1,
+        cz * x1 - sz * y1,
+        cz * y1 + sz * x1,
+        cz * z1 + sz * w1,
+    ], axis=1).astype(np.float32))
+
+
+def _chop_arrays(chop):
+    """Extract recognized channel groups from a SOP-to-CHOP as float32 arrays."""
     import numpy as np
     arr = chop.numpyArray()   # (numChans, numSamples) float32
     names = [c.name for c in chop.chans()]
+
     def idx(n):
         return names.index(n) if n in names else None
-    ix, iy, iz = idx('tx'), idx('ty'), idx('tz')
-    if ix is None:
-        return None, None
-    pos = np.ascontiguousarray(arr[[ix, iy, iz]].T.astype(np.float32))
-    col = None
-    ir, ig, ib = idx('cr'), idx('cg'), idx('cb')
-    if ir is not None:
+
+    def vec(chans):
+        ids = [idx(c) for c in chans]
+        if any(i is None for i in ids):
+            return None
+        return np.ascontiguousarray(arr[ids].T.astype(np.float32))
+
+    pos = vec(('tx', 'ty', 'tz'))
+    if pos is None:
+        return None
+    out = {'pos': pos}
+    rgb = vec(('cr', 'cg', 'cb'))
+    if rgb is not None:
         ia = idx('ca')
-        a = arr[ia] if ia is not None else np.ones(arr.shape[1], np.float32)
-        col = np.ascontiguousarray(
-            np.stack([arr[ir], arr[ig], arr[ib], a], axis=1).astype(np.float32))
-    return pos, col
+        a = (arr[ia].astype(np.float32) if ia is not None
+             else np.ones(arr.shape[1], np.float32))
+        out['col'] = np.ascontiguousarray(
+            np.concatenate([rgb, a[:, None]], axis=1).astype(np.float32))
+    out['vel'] = vec(('vx', 'vy', 'vz'))
+    out['scale'] = vec(('sx', 'sy', 'sz'))
+    rot = vec(('rx', 'ry', 'rz'))
+    out['rot'] = _euler_deg_to_quat(rot) if rot is not None else None
+    nrm = vec(('nx', 'ny', 'nz'))
+    if nrm is None:
+        nrm = vec(('N(0)', 'N(1)', 'N(2)'))
+    out['nrm'] = nrm
+    uv = vec(('u', 'v'))
+    if uv is None:
+        uv = vec(('uv(0)', 'uv(1)'))
+    out['uv'] = uv
+    return out
 
 
-def send_points(td_path, bl_name):
+def _pack_points(data):
+    pos = data['pos']
+    n = pos.shape[0]
+    flags = 0
+    blocks = [pos.tobytes()]
+    if data.get('col') is not None:
+        flags |= 1
+        blocks.append(data['col'].tobytes())
+    if PROTOCOL >= 2:
+        if data.get('vel') is not None:
+            flags |= 2
+            blocks.append(data['vel'].tobytes())
+        if data.get('scale') is not None:
+            flags |= 4
+            blocks.append(data['scale'].tobytes())
+        if data.get('rot') is not None:
+            flags |= 8
+            blocks.append(data['rot'].tobytes())
+    return struct.pack('<IB', n, flags) + b''.join(blocks)
+
+
+def send_points(td_path, bl_name, kind=1):
     o = op(td_path)
     if o is None:
         return
     if o.family == 'CHOP':
-        pos, col = _positions_from_chop(o)
-        if pos is None:
+        data = _chop_arrays(o)
+        if data is None:
             return
-        n = pos.shape[0]
-        if col is not None:
-            body = struct.pack('<IB', n, 1) + pos.tobytes() + col.tobytes()
-        else:
-            body = struct.pack('<IB', n, 0) + pos.tobytes()
+        body = _pack_points(data)
     else:  # SOP fallback (slow for large counts)
         pts = o.points
         n = len(pts)
@@ -233,7 +311,11 @@ def send_points(td_path, bl_name):
         for p in pts:
             buf += struct.pack('<fff', p.x, p.y, p.z)
         body = struct.pack('<IB', n, 0) + bytes(buf)
-    _net.send_frame(1, bl_name, body)
+    _net.send_frame(kind, bl_name, body)
+
+
+def send_instances(td_path, bl_name):
+    send_points(td_path, bl_name, kind=3)
 
 
 def _sop_triangles(sop):
@@ -259,16 +341,18 @@ def send_mesh(td_path, bl_name):
     npts, nprims = len(sop.points), len(sop.prims)
 
     pos_chop_path = MESH_POS_CHOPS.get(td_path)
-    pos = None
+    data = None
     if pos_chop_path:
         chop = op(pos_chop_path)
         if chop is not None and chop.family == 'CHOP':
-            pos, _ = _positions_from_chop(chop)
-    if pos is None:
+            data = _chop_arrays(chop)
+    if data is None:
         import numpy as np
         pos = np.empty((npts, 3), np.float32)
         for i, p in enumerate(sop.points):
             pos[i, 0], pos[i, 1], pos[i, 2] = p.x, p.y, p.z
+        data = {'pos': pos}
+    pos = data['pos']
 
     key = td_path
     tris = None
@@ -283,8 +367,21 @@ def send_mesh(td_path, bl_name):
 
     import numpy as np
     tri_arr = np.asarray(tris, np.uint32)
-    body = (struct.pack('<II', pos.shape[0], len(tri_arr) // 3)
-            + pos.astype(np.float32).tobytes() + tri_arr.tobytes())
+    nv, ntri = pos.shape[0], len(tri_arr) // 3
+    if PROTOCOL >= 2:
+        flags = 0
+        extra = b''
+        if data.get('nrm') is not None and data['nrm'].shape[0] == nv:
+            flags |= 1
+            extra += data['nrm'].tobytes()
+        if data.get('uv') is not None and data['uv'].shape[0] == nv:
+            flags |= 2
+            extra += data['uv'].tobytes()
+        body = (struct.pack('<IIB', nv, ntri, flags)
+                + pos.astype(np.float32).tobytes() + tri_arr.tobytes() + extra)
+    else:
+        body = (struct.pack('<II', nv, ntri)
+                + pos.astype(np.float32).tobytes() + tri_arr.tobytes())
     _net.send_frame(2, bl_name, body)
 
 
@@ -313,5 +410,7 @@ def tick():
     _safe(send_params)
     for td_path, bl_name in POINT_OPS.items():
         _safe(send_points, td_path, bl_name)
+    for td_path, bl_name in INSTANCE_OPS.items():
+        _safe(send_instances, td_path, bl_name)
     for td_path, bl_name in MESH_SOPS.items():
         _safe(send_mesh, td_path, bl_name)

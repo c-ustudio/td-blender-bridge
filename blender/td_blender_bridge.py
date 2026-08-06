@@ -1,7 +1,7 @@
 bl_info = {
     "name": "TouchDesigner Bridge (TD -> Blender)",
     "author": "enric + Claude",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > TD Bridge",
     "description": "Two-way realtime bridge with TouchDesigner: drive cameras, transforms, params and geometry from TD (UDP/TCP), stream EEVEE frames back to TD, record & bake to keyframes",
@@ -43,6 +43,7 @@ import select
 import struct
 import threading
 import time
+import zlib
 import numpy as np
 from bpy.app.handlers import persistent
 from mathutils import Matrix
@@ -172,34 +173,79 @@ def _handle_udp(data):
 def _handle_tcp_frame(payload):
     if len(payload) < 8 or payload[0:4] != b"TDBG":
         return
+    ver = payload[4]
     kind = payload[5]
     (name_len,) = struct.unpack_from("<H", payload, 6)
     name = payload[8:8 + name_len].decode("utf-8", "replace")
-    off = 8 + name_len
+    body = payload[8 + name_len:]
+    if kind & 0x80:            # v2: zlib-compressed body
+        kind &= 0x7F
+        try:
+            body = zlib.decompress(body)
+        except zlib.error:
+            return
     try:
-        if kind == 1:  # points
-            n, has_col = struct.unpack_from("<IB", payload, off)
-            off += 5
-            pos = payload[off:off + n * 12]
-            off += n * 12
-            col = payload[off:off + n * 16] if has_col else None
-            g = {"kind": 1, "n": n, "pos": pos, "col": col, "tris": None}
-        elif kind == 2:  # mesh
-            nv, nt = struct.unpack_from("<II", payload, off)
-            off += 8
-            pos = payload[off:off + nv * 12]
-            off += nv * 12
-            tris = payload[off:off + nt * 12]
-            g = {"kind": 2, "n": nv, "nt": nt, "pos": pos, "tris": tris, "col": None}
+        if kind in (1, 3):     # 1 = points, 3 = instance transforms
+            g = _parse_points(body, kind)
+        elif kind == 2:        # mesh
+            g = _parse_mesh(body, ver)
         else:
             return
-    except struct.error:
+    except (struct.error, ValueError):
         return
     with S.lock:
         S.geo[name] = g
         S.dirty_g.add(name)
         S.pkts += 1
         S._pps_n += 1
+
+
+def _parse_points(body, kind):
+    """v1's 'has_color' byte is bit 0 of the v2 flags byte, so both versions
+    parse identically. flags: 1 color, 2 velocity, 4 scale, 8 rotation."""
+    n, flags = struct.unpack_from("<IB", body, 0)
+    off = 5
+
+    def take(nbytes):
+        nonlocal off
+        chunk = body[off:off + nbytes]
+        if len(chunk) < nbytes:
+            raise ValueError("short frame")
+        off += nbytes
+        return chunk
+
+    pos = take(n * 12)
+    col = take(n * 16) if flags & 1 else None
+    vel = take(n * 12) if flags & 2 else None
+    scale = take(n * 12) if flags & 4 else None
+    rot = take(n * 16) if flags & 8 else None    # quaternions (w,x,y,z)
+    return {"kind": kind, "n": n, "pos": pos, "col": col, "vel": vel,
+            "scale": scale, "rot": rot, "tris": None}
+
+
+def _parse_mesh(body, ver):
+    """v2 inserts a flags byte after the counts: 1 normals, 2 UVs."""
+    nv, nt = struct.unpack_from("<II", body, 0)
+    off = 8
+    flags = 0
+    if ver >= 2:
+        flags = body[8]
+        off = 9
+
+    def take(nbytes):
+        nonlocal off
+        chunk = body[off:off + nbytes]
+        if len(chunk) < nbytes:
+            raise ValueError("short frame")
+        off += nbytes
+        return chunk
+
+    pos = take(nv * 12)
+    tris = take(nt * 12)
+    nrm = take(nv * 12) if flags & 1 else None
+    uv = take(nv * 8) if flags & 2 else None
+    return {"kind": 2, "n": nv, "nt": nt, "pos": pos, "tris": tris,
+            "col": None, "nrm": nrm, "uv": uv}
 
 
 def _drain_conn(conn):
@@ -332,43 +378,135 @@ def _ensure_points_material():
     return mat
 
 
-def _ensure_points_setup(obj):
-    """First arrival of a points object: instance spheres on the vertices via
-    Geometry Nodes and shade them from td_color, so streamed point clouds are
-    visible in EEVEE renders (bare vertices only show in the viewport)."""
-    if obj.modifiers.get("TDB Points") is not None:
-        return
-    ng = bpy.data.node_groups.get("TDB_Points")
+GN_VER = 2   # bump to rebuild the managed node groups on next arrival
+
+
+def _managed_group(name, builder):
+    ng = bpy.data.node_groups.get(name)
+    if ng is not None and ng.get("tdb_ver") != GN_VER:
+        bpy.data.node_groups.remove(ng)   # stale layout: rebuild
+        ng = None
     if ng is None:
-        ng = bpy.data.node_groups.new("TDB_Points", 'GeometryNodeTree')
-        ng.interface.new_socket("Geometry", in_out='INPUT',
-                                socket_type='NodeSocketGeometry')
-        ng.interface.new_socket("Geometry", in_out='OUTPUT',
-                                socket_type='NodeSocketGeometry')
-        rad = ng.interface.new_socket("Radius", in_out='INPUT',
-                                      socket_type='NodeSocketFloat')
-        rad.default_value = 0.02
-        rad.min_value = 0.0
-        n_in = ng.nodes.new('NodeGroupInput')
-        n_in.location = (-400, 0)
-        ico = ng.nodes.new('GeometryNodeMeshIcoSphere')
-        ico.location = (-400, -160)
-        ico.inputs['Subdivisions'].default_value = 1
-        iop = ng.nodes.new('GeometryNodeInstanceOnPoints')
-        iop.location = (-180, 0)
-        setmat = ng.nodes.new('GeometryNodeSetMaterial')
-        setmat.location = (40, 0)
-        setmat.inputs['Material'].default_value = _ensure_points_material()
-        n_out = ng.nodes.new('NodeGroupOutput')
-        n_out.location = (260, 0)
-        ng.links.new(n_in.outputs['Geometry'], iop.inputs['Points'])
-        ng.links.new(n_in.outputs['Radius'], ico.inputs['Radius'])
-        ng.links.new(ico.outputs['Mesh'], iop.inputs['Instance'])
-        ng.links.new(iop.outputs['Instances'], setmat.inputs['Geometry'])
-        ng.links.new(setmat.outputs['Geometry'], n_out.inputs['Geometry'])
-    mod = obj.modifiers.new("TDB Points", 'NODES')
-    if mod is not None:
+        ng = builder(name)
+        ng["tdb_ver"] = GN_VER
+    return ng
+
+
+def _ensure_gn_modifier(obj, mod_name, group_name, builder):
+    ng = _managed_group(group_name, builder)
+    mod = obj.modifiers.get(mod_name)
+    if mod is None:
+        mod = obj.modifiers.new(mod_name, 'NODES')
+    if mod is not None and mod.node_group is not ng:
         mod.node_group = ng
+
+
+def _gn_wire_transforms(ng, iop):
+    """Feed td_scale / td_rot named attributes into Instance on Points, with
+    identity fallbacks when the stream doesn't carry them."""
+    na_s = ng.nodes.new('GeometryNodeInputNamedAttribute')
+    na_s.data_type = 'FLOAT_VECTOR'
+    na_s.inputs['Name'].default_value = "td_scale"
+    na_s.location = (iop.location.x - 240, -280)
+    sw_s = ng.nodes.new('GeometryNodeSwitch')
+    sw_s.input_type = 'VECTOR'
+    sw_s.location = (iop.location.x - 40, -280)
+    sw_s.inputs['False'].default_value = (1.0, 1.0, 1.0)
+    ng.links.new(na_s.outputs['Exists'], sw_s.inputs['Switch'])
+    ng.links.new(na_s.outputs['Attribute'], sw_s.inputs['True'])
+    ng.links.new(sw_s.outputs['Output'], iop.inputs['Scale'])
+
+    na_r = ng.nodes.new('GeometryNodeInputNamedAttribute')
+    na_r.data_type = 'QUATERNION'
+    na_r.inputs['Name'].default_value = "td_rot"
+    na_r.location = (iop.location.x - 240, -460)
+    sw_r = ng.nodes.new('GeometryNodeSwitch')
+    sw_r.input_type = 'ROTATION'
+    sw_r.location = (iop.location.x - 40, -460)
+    ng.links.new(na_r.outputs['Exists'], sw_r.inputs['Switch'])
+    ng.links.new(na_r.outputs['Attribute'], sw_r.inputs['True'])
+    ng.links.new(sw_r.outputs['Output'], iop.inputs['Rotation'])
+
+
+def _build_points_group(name):
+    """Points -> shaded sphere instances (visible in EEVEE renders)."""
+    ng = bpy.data.node_groups.new(name, 'GeometryNodeTree')
+    ng.interface.new_socket("Geometry", in_out='INPUT',
+                            socket_type='NodeSocketGeometry')
+    ng.interface.new_socket("Geometry", in_out='OUTPUT',
+                            socket_type='NodeSocketGeometry')
+    rad = ng.interface.new_socket("Radius", in_out='INPUT',
+                                  socket_type='NodeSocketFloat')
+    rad.default_value = 0.02
+    rad.min_value = 0.0
+    n_in = ng.nodes.new('NodeGroupInput')
+    n_in.location = (-420, 0)
+    ico = ng.nodes.new('GeometryNodeMeshIcoSphere')
+    ico.location = (-420, -170)
+    ico.inputs['Subdivisions'].default_value = 1
+    iop = ng.nodes.new('GeometryNodeInstanceOnPoints')
+    iop.location = (-180, 0)
+    setmat = ng.nodes.new('GeometryNodeSetMaterial')
+    setmat.location = (60, 0)
+    setmat.inputs['Material'].default_value = _ensure_points_material()
+    n_out = ng.nodes.new('NodeGroupOutput')
+    n_out.location = (280, 0)
+    ng.links.new(n_in.outputs['Geometry'], iop.inputs['Points'])
+    ng.links.new(n_in.outputs['Radius'], ico.inputs['Radius'])
+    ng.links.new(ico.outputs['Mesh'], iop.inputs['Instance'])
+    ng.links.new(iop.outputs['Instances'], setmat.inputs['Geometry'])
+    ng.links.new(setmat.outputs['Geometry'], n_out.inputs['Geometry'])
+    _gn_wire_transforms(ng, iop)
+    return ng
+
+
+def _build_instances_group(name):
+    """Streamed transforms -> instances of a user-chosen object. Until
+    'Use Object' is enabled the points show as spheres (same as TDB_Points)
+    so a fresh stream is never invisible."""
+    ng = bpy.data.node_groups.new(name, 'GeometryNodeTree')
+    ng.interface.new_socket("Geometry", in_out='INPUT',
+                            socket_type='NodeSocketGeometry')
+    ng.interface.new_socket("Geometry", in_out='OUTPUT',
+                            socket_type='NodeSocketGeometry')
+    ng.interface.new_socket("Instance Object", in_out='INPUT',
+                            socket_type='NodeSocketObject')
+    ng.interface.new_socket("Use Object", in_out='INPUT',
+                            socket_type='NodeSocketBool')
+    rad = ng.interface.new_socket("Radius", in_out='INPUT',
+                                  socket_type='NodeSocketFloat')
+    rad.default_value = 0.05
+    rad.min_value = 0.0
+    n_in = ng.nodes.new('NodeGroupInput')
+    n_in.location = (-680, 0)
+    ico = ng.nodes.new('GeometryNodeMeshIcoSphere')
+    ico.location = (-680, -200)
+    ico.inputs['Subdivisions'].default_value = 1
+    setmat = ng.nodes.new('GeometryNodeSetMaterial')
+    setmat.location = (-500, -200)
+    setmat.inputs['Material'].default_value = _ensure_points_material()
+    info = ng.nodes.new('GeometryNodeObjectInfo')
+    info.location = (-500, -380)
+    info.transform_space = 'ORIGINAL'
+    info.inputs['As Instance'].default_value = True
+    sw = ng.nodes.new('GeometryNodeSwitch')
+    sw.input_type = 'GEOMETRY'
+    sw.location = (-320, -200)
+    iop = ng.nodes.new('GeometryNodeInstanceOnPoints')
+    iop.location = (-120, 0)
+    n_out = ng.nodes.new('NodeGroupOutput')
+    n_out.location = (120, 0)
+    ng.links.new(n_in.outputs['Radius'], ico.inputs['Radius'])
+    ng.links.new(ico.outputs['Mesh'], setmat.inputs['Geometry'])
+    ng.links.new(n_in.outputs['Instance Object'], info.inputs['Object'])
+    ng.links.new(n_in.outputs['Use Object'], sw.inputs['Switch'])
+    ng.links.new(setmat.outputs['Geometry'], sw.inputs['False'])
+    ng.links.new(info.outputs['Geometry'], sw.inputs['True'])
+    ng.links.new(n_in.outputs['Geometry'], iop.inputs['Points'])
+    ng.links.new(sw.outputs['Output'], iop.inputs['Instance'])
+    ng.links.new(iop.outputs['Instances'], n_out.inputs['Geometry'])
+    _gn_wire_transforms(ng, iop)
+    return ng
 
 
 def _update_geo(name):
@@ -386,26 +524,41 @@ def _update_geo(name):
     elif obj.data is not me:
         obj.data = me
     if g["kind"] == 1:
-        _ensure_points_setup(obj)
+        _ensure_gn_modifier(obj, "TDB Points", "TDB_Points",
+                            _build_points_group)
+    elif g["kind"] == 3:
+        _ensure_gn_modifier(obj, "TDB Instances", "TDB_Instances",
+                            _build_instances_group)
 
     pos = np.frombuffer(g["pos"], dtype=np.float32).reshape(-1, 3)[:n]
     pos = td_points_to_blender(pos).astype(np.float32)
 
-    if g["kind"] == 1:  # points
+    if g["kind"] in (1, 3):  # points / instance transforms
         if len(me.vertices) == n and len(me.polygons) == 0:
             me.vertices.foreach_set("co", pos.ravel())
             me.update()
         else:
             me.clear_geometry()
             me.from_pydata(pos.tolist(), [], [])
-        if g["col"] is not None:
+        if g.get("col") is not None:
             col = np.frombuffer(g["col"], dtype=np.float32).reshape(-1, 4)[:n]
-            attr = me.attributes.get("td_color")
-            if attr is None or len(attr.data) != n:
-                if attr is not None:
-                    me.attributes.remove(attr)
-                attr = me.attributes.new("td_color", 'FLOAT_COLOR', 'POINT')
-            attr.data.foreach_set("color", col.ravel())
+            _set_point_attr(me, "td_color", 'FLOAT_COLOR', "color", n, col)
+        if g.get("vel") is not None:
+            vel = np.frombuffer(g["vel"], dtype=np.float32).reshape(-1, 3)[:n]
+            _set_point_attr(me, "td_velocity", 'FLOAT_VECTOR', "vector", n,
+                            td_points_to_blender(vel))
+        if g.get("scale") is not None:
+            sc = np.frombuffer(g["scale"], dtype=np.float32).reshape(-1, 3)[:n]
+            _set_point_attr(me, "td_scale", 'FLOAT_VECTOR', "vector", n,
+                            sc[:, (0, 2, 1)])       # y/z swap, no sign flip
+        if g.get("rot") is not None:
+            q = np.frombuffer(g["rot"], dtype=np.float32).reshape(-1, 4)[:n]
+            qb = np.empty_like(q)                   # conjugation by the basis
+            qb[:, 0] = q[:, 0]                      # change C (a +90deg X
+            qb[:, 1] = q[:, 1]                      # rotation) permutes the
+            qb[:, 2] = -q[:, 3]                     # vector part like a
+            qb[:, 3] = q[:, 2]                      # vector: (x,-z,y)
+            _set_point_attr(me, "td_rot", 'QUATERNION', "value", n, qb)
     else:  # mesh
         nt = g["nt"]
         tris = np.frombuffer(g["tris"], dtype=np.uint32).reshape(-1, 3)[:nt]
@@ -419,6 +572,31 @@ def _update_geo(name):
             me.from_pydata(pos.tolist(), [], tris.tolist())
             me["tdb_topo"] = int(n * 100003 + nt)
         me.update()
+        if g.get("nrm") is not None:
+            nrm = np.frombuffer(g["nrm"], dtype=np.float32).reshape(-1, 3)[:n]
+            try:
+                me.normals_split_custom_set_from_vertices(
+                    td_points_to_blender(nrm).tolist())
+            except (AttributeError, RuntimeError):
+                pass   # API drift across versions; auto normals still work
+        if g.get("uv") is not None:
+            uv = np.frombuffer(g["uv"], dtype=np.float32).reshape(-1, 2)[:n]
+            if not me.uv_layers:
+                me.uv_layers.new(name="td_uv")
+            layer = me.uv_layers[0]
+            if len(layer.data) == tris.size:    # per-loop = per corner
+                layer.data.foreach_set(
+                    "uv", np.ascontiguousarray(uv[tris.ravel()]).ravel())
+
+
+def _set_point_attr(me, name, dtype, key, n, data):
+    attr = me.attributes.get(name)
+    if attr is None or attr.data_type != dtype or len(attr.data) != n:
+        if attr is not None:
+            me.attributes.remove(attr)
+        attr = me.attributes.new(name, dtype, 'POINT')
+    attr.data.foreach_set(
+        key, np.ascontiguousarray(data, dtype=np.float32).ravel())
 
 
 def _redraw():
