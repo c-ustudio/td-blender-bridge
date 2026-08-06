@@ -523,12 +523,15 @@ def _update_geo(name):
         bpy.context.scene.collection.objects.link(obj)
     elif obj.data is not me:
         obj.data = me
-    if g["kind"] == 1:
-        _ensure_gn_modifier(obj, "TDB Points", "TDB_Points",
-                            _build_points_group)
-    elif g["kind"] == 3:
-        _ensure_gn_modifier(obj, "TDB Instances", "TDB_Instances",
-                            _build_instances_group)
+    # instancing a sphere per point melts down on huge clouds (1M points ->
+    # ~80M tris); past this size leave the raw vertices alone
+    if n <= 250_000:
+        if g["kind"] == 1:
+            _ensure_gn_modifier(obj, "TDB Points", "TDB_Points",
+                                _build_points_group)
+        elif g["kind"] == 3:
+            _ensure_gn_modifier(obj, "TDB Instances", "TDB_Instances",
+                                _build_instances_group)
 
     pos = np.frombuffer(g["pos"], dtype=np.float32).reshape(-1, 3)[:n]
     pos = td_points_to_blender(pos).astype(np.float32)
