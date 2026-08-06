@@ -108,6 +108,10 @@ class _State:
         self.rec_t0 = None
         self.rec = []      # (t, {name: (vals16, camdict)}, {(name,path): value})
         self.bake_active = False   # bake_recording() drives frame_set itself
+        # live/bake arbitration: actions parked while their object is being
+        # streamed (baked keyframes would override the stream every frame,
+        # since animation evaluates after frame_change_pre)
+        self.muted = {}    # object name -> {"obj": (action, slot), "data": ...}
         # frame server (Blender -> TD)
         self.fs_sock = None
         self.fs_clients = []
@@ -351,6 +355,45 @@ def _redraw():
                 a.tag_redraw()
 
 
+def _park_action(store, key, holder):
+    ad = holder.animation_data
+    if ad is not None and ad.action is not None:
+        slot = getattr(ad, "action_slot", None)
+        store[key] = (ad.action, slot)
+        ad.action = None
+
+
+def _mute_actions(obj):
+    """Park a streamed object's action (and its camera data's action) so
+    baked keyframes can't override the live stream. Restored on Stop Bridge."""
+    entry = S.muted.setdefault(obj.name, {})
+    _park_action(entry, "obj", obj)
+    if obj.type == 'CAMERA':
+        _park_action(entry, "data", obj.data)
+
+
+def _restore_actions():
+    for name, entry in S.muted.items():
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            continue
+        for key, holder in (("obj", obj),
+                            ("data", obj.data if obj.type == 'CAMERA' else None)):
+            parked = entry.get(key)
+            if parked is None or holder is None:
+                continue
+            action, slot = parked
+            try:
+                if holder.animation_data is None:
+                    holder.animation_data_create()
+                holder.animation_data.action = action
+                if slot is not None:
+                    holder.animation_data.action_slot = slot
+            except Exception as e:
+                S.last_error = f"restore action {name}: {e}"
+    S.muted.clear()
+
+
 def _apply_latest():
     """Drain the latest-value stores and write them into the scene.
 
@@ -375,8 +418,11 @@ def _apply_latest():
     changed = bool(dx or dp or dg)
     if changed:
         try:
+            live_mute = getattr(bpy.context.scene, "tdb_live_mute", True)
             for name, (vals, camdict) in dx.items():
                 obj = _ensure_object(name, camdict)
+                if live_mute:
+                    _mute_actions(obj)
                 view = camdict is not None or obj.type in ('CAMERA', 'LIGHT')
                 obj.matrix_world = td_matrix_to_blender(vals, view)
                 _apply_camera_props(obj, camdict)
@@ -653,6 +699,7 @@ def start_bridge(udp_port=9500, tcp_port=9501):
 
 def stop_bridge():
     S.running = False
+    _restore_actions()
     _remove_frame_handler()
     try:
         if bpy.app.timers.is_registered(_apply_timer):
@@ -818,9 +865,13 @@ class TDB_PT_panel(bpy.types.Panel):
         col = lay.column()
         col.prop(context.scene, "tdb_udp_port")
         col.prop(context.scene, "tdb_tcp_port")
+        col.prop(context.scene, "tdb_live_mute")
         if S.running:
             col.operator("tdb.stop", icon='PAUSE')
             col.label(text=f"running - {S.pps:.0f} msg/s, {S.pkts} total")
+            if S.muted:
+                col.label(text=f"{len(S.muted)} action(s) parked while live",
+                          icon='ACTION')
         else:
             col.operator("tdb.start", icon='PLAY')
             col.label(text="stopped")
@@ -867,6 +918,11 @@ def register():
         except Exception:
             pass
 
+    bpy.types.Scene.tdb_live_mute = bpy.props.BoolProperty(
+        name="Live overrides baked actions", default=True,
+        description="While the bridge runs, park actions on streamed objects "
+                    "so baked keyframes don't fight the stream; restored on "
+                    "Stop Bridge")
     bpy.types.Scene.tdb_udp_port = bpy.props.IntProperty(
         name="UDP port", default=9500, min=1024, max=65535)
     bpy.types.Scene.tdb_tcp_port = bpy.props.IntProperty(
@@ -896,7 +952,7 @@ def unregister():
             bpy.utils.unregister_class(c)
         except RuntimeError:
             pass
-    for p in ("tdb_udp_port", "tdb_tcp_port", "tdb_fs_port",
+    for p in ("tdb_udp_port", "tdb_tcp_port", "tdb_live_mute", "tdb_fs_port",
               "tdb_fs_width", "tdb_fs_height", "tdb_fs_fps"):
         if hasattr(bpy.types.Scene, p):
             delattr(bpy.types.Scene, p)
