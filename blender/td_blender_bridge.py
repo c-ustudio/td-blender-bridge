@@ -118,6 +118,13 @@ class _State:
         self.fs_interval = 1.0 / 30.0
         self.fs_frames = 0
         self.fs_error = ""
+        # capture happens in a View3D draw callback (EEVEE offscreen draws
+        # crash outside a draw context); the timer only does socket I/O
+        self.fs_draw_handle = None
+        self.fs_latest = None      # last captured RGBA8 bytes
+        self.fs_last_cap = 0.0
+        self.fs_seq = 0            # bumped per capture
+        self.fs_sent_seq = 0
 
 
 S = _State()
@@ -441,14 +448,21 @@ def _fs_find_view3d():
 
 
 def _fs_capture():
-    """Render the scene camera offscreen (EEVEE viewport shading) -> RGBA8."""
+    """Render the scene camera offscreen (EEVEE viewport shading) -> RGBA8.
+
+    Must run inside a View3D draw callback: EEVEE's offscreen draw touches
+    live GPU state and segfaults when invoked from a timer (no draw context).
+    """
     import gpu
     scene = bpy.context.scene
     cam = scene.camera
     if cam is None:
         return None
     w, h = S.fs_size
-    space, region = _fs_find_view3d()
+    space = getattr(bpy.context, "space_data", None)
+    region = bpy.context.region
+    if space is None or space.type != 'VIEW_3D' or region is None:
+        space, region = _fs_find_view3d()
     if space is None:
         return None
     if (S.fs_offscreen is None
@@ -475,7 +489,27 @@ def _fs_capture():
         return _np.array(buf.to_list(), dtype=_np.uint8).tobytes()
 
 
+def _fs_draw():
+    """View3D draw callback: capture at most once per fs_interval."""
+    if not S.fs_running or not S.fs_clients:
+        return
+    now = time.time()
+    if now - S.fs_last_cap < S.fs_interval * 0.9:
+        return
+    S.fs_last_cap = now
+    try:
+        pixels = _fs_capture()
+    except Exception as e:
+        S.fs_error = "capture: %s" % e
+        return
+    if pixels is not None:
+        S.fs_latest = pixels
+        S.fs_seq += 1
+
+
 def _fs_tick():
+    """Timer: sockets only. Tags redraws so _fs_draw keeps producing frames
+    even when the viewport is otherwise idle."""
     if not S.fs_running:
         return None
     # accept new clients (non-blocking)
@@ -493,13 +527,11 @@ def _fs_tick():
             break
     if not S.fs_clients:
         return S.fs_interval
-    try:
-        pixels = _fs_capture()
-    except Exception as e:
-        S.fs_error = "capture: %s" % e
-        return S.fs_interval
-    if pixels is None:
-        return S.fs_interval
+    _redraw()
+    if S.fs_latest is None or S.fs_seq == S.fs_sent_seq:
+        return S.fs_interval / 2
+    S.fs_sent_seq = S.fs_seq
+    pixels = S.fs_latest
     w, h = S.fs_size
     header = b"TDBF" + bytes([1, 1]) + struct.pack("<HH", w, h)
     payload = header + pixels
@@ -522,7 +554,7 @@ def _fs_tick():
             pass
         except OSError:
             _fs_drop(c)
-    return S.fs_interval
+    return S.fs_interval / 2
 
 
 def _fs_drop(c):
@@ -554,12 +586,23 @@ def start_frame_server(port=9502, width=960, height=540, fps=30):
     S.fs_running = True
     S.fs_frames = 0
     S.fs_error = ""
+    S.fs_latest = None
+    S.fs_seq = S.fs_sent_seq = 0
+    S.fs_last_cap = 0.0
+    S.fs_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+        _fs_draw, (), 'WINDOW', 'POST_PIXEL')
     bpy.app.timers.register(_fs_tick, first_interval=0.1)
     return True
 
 
 def stop_frame_server():
     S.fs_running = False
+    if S.fs_draw_handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(S.fs_draw_handle, 'WINDOW')
+        except Exception:
+            pass
+        S.fs_draw_handle = None
     try:
         if bpy.app.timers.is_registered(_fs_tick):
             bpy.app.timers.unregister(_fs_tick)
@@ -574,6 +617,7 @@ def stop_frame_server():
             pass
     S.fs_sock = None
     S.fs_offscreen = None
+    S.fs_latest = None
 
 
 # -- lifecycle ---------------------------------------------------------------
@@ -813,6 +857,16 @@ _classes = (TDB_OT_start, TDB_OT_stop, TDB_OT_record, TDB_OT_bake,
 
 
 def register():
+    # A previous run of this script (Text Editor re-run) may still have live
+    # timers, handlers and sockets bound to its own module instance -- its
+    # timers would keep drawing with freed GPU resources. Stop it first.
+    prev_stop = bpy.app.driver_namespace.get("tdb_stop")
+    if prev_stop is not None:
+        try:
+            prev_stop()
+        except Exception:
+            pass
+
     bpy.types.Scene.tdb_udp_port = bpy.props.IntProperty(
         name="UDP port", default=9500, min=1024, max=65535)
     bpy.types.Scene.tdb_tcp_port = bpy.props.IntProperty(
