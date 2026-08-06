@@ -112,6 +112,12 @@ class _State:
         # streamed (baked keyframes would override the stream every frame,
         # since animation evaluates after frame_change_pre)
         self.muted = {}    # object name -> {"obj": (action, slot), "data": ...}
+        # TD master clock (stamped on every UDP message by the sender)
+        self.td_frame = None   # TD timeline frame ("fr")
+        self.td_time = None    # TD absTime.seconds ("tm")
+        self.rec_td_t0 = None  # TD-time origin of the current recording
+        # per-object exponential smoothing state: name -> (loc, quat, scale)
+        self.smooth = {}
         # frame server (Blender -> TD)
         self.fs_sock = None
         self.fs_clients = []
@@ -143,6 +149,12 @@ def _handle_udp(data):
         return
     t = msg.get("t")
     with S.lock:
+        fr = msg.get("fr")
+        if fr is not None:
+            S.td_frame = fr
+        tm = msg.get("tm")
+        if tm is not None:
+            S.td_time = tm
         if t == "xform":
             S.xforms[msg["n"]] = (msg["m"], msg.get("cam"))
             S.dirty_x.add(msg["n"])
@@ -418,13 +430,16 @@ def _apply_latest():
     changed = bool(dx or dp or dg)
     if changed:
         try:
-            live_mute = getattr(bpy.context.scene, "tdb_live_mute", True)
+            scene = bpy.context.scene
+            live_mute = getattr(scene, "tdb_live_mute", True)
+            smooth = getattr(scene, "tdb_smooth", 0.0)
             for name, (vals, camdict) in dx.items():
                 obj = _ensure_object(name, camdict)
                 if live_mute:
                     _mute_actions(obj)
                 view = camdict is not None or obj.type in ('CAMERA', 'LIGHT')
-                obj.matrix_world = td_matrix_to_blender(vals, view)
+                m = td_matrix_to_blender(vals, view)
+                obj.matrix_world = _smoothed(name, m, smooth)
                 _apply_camera_props(obj, camdict)
             for (name, path), v in dp.items():
                 _set_param(name, path, v)
@@ -435,9 +450,36 @@ def _apply_latest():
 
     if S.record and changed:
         with S.lock:
-            t = time.time() - S.rec_t0
+            # prefer the TD clock stamped on the stream: bake becomes
+            # frame-accurate against TD instead of local arrival time
+            if S.td_time is not None:
+                if S.rec_td_t0 is None:
+                    S.rec_td_t0 = S.td_time
+                t = S.td_time - S.rec_td_t0
+            else:
+                t = time.time() - S.rec_t0
             S.rec.append((t, dict(dx), dict(dp)))
     return changed
+
+
+def _smoothed(name, m, factor):
+    """Exponential smoothing toward the streamed matrix (0 = off).
+
+    Loc/scale lerp, rotation slerp; state resets when smoothing is disabled
+    so re-enabling never snaps from a stale pose.
+    """
+    if factor <= 0.0:
+        S.smooth.pop(name, None)
+        return m
+    loc, rot, scale = m.decompose()
+    prev = S.smooth.get(name)
+    if prev is not None:
+        a = 1.0 - factor
+        loc = prev[0].lerp(loc, a)
+        rot = prev[1].slerp(rot, a)
+        scale = prev[2].lerp(scale, a)
+    S.smooth[name] = (loc, rot, scale)
+    return Matrix.LocRotScale(loc, rot, scale)
 
 
 @persistent
@@ -464,6 +506,16 @@ def _apply_timer():
         return None
     if _is_playing():
         return 0.1     # frame_change_pre owns the apply; just poll for stop
+    scene = bpy.context.scene
+    if getattr(scene, "tdb_slave_timeline", False) and S.td_frame is not None:
+        # TD is the master clock: follow its timeline frame. frame_set fires
+        # _tdb_frame_pre, which applies the stream in sync with evaluation.
+        # (Leave Blender's own playback stopped while slaved.)
+        f = int(round(S.td_frame))
+        if f != scene.frame_current:
+            scene.frame_set(f)
+            _redraw()
+            return 1.0 / 60.0
     if _apply_latest():
         _redraw()
     return 1.0 / 60.0
@@ -724,6 +776,7 @@ def start_recording():
     with S.lock:
         S.rec = []
         S.rec_t0 = time.time()
+        S.rec_td_t0 = None
         S.record = True
 
 
@@ -866,12 +919,16 @@ class TDB_PT_panel(bpy.types.Panel):
         col.prop(context.scene, "tdb_udp_port")
         col.prop(context.scene, "tdb_tcp_port")
         col.prop(context.scene, "tdb_live_mute")
+        col.prop(context.scene, "tdb_slave_timeline")
+        col.prop(context.scene, "tdb_smooth", slider=True)
         if S.running:
             col.operator("tdb.stop", icon='PAUSE')
             col.label(text=f"running - {S.pps:.0f} msg/s, {S.pkts} total")
             if S.muted:
                 col.label(text=f"{len(S.muted)} action(s) parked while live",
                           icon='ACTION')
+            if S.td_frame is not None:
+                col.label(text=f"TD frame {S.td_frame:.0f}", icon='TIME')
         else:
             col.operator("tdb.start", icon='PLAY')
             col.label(text="stopped")
@@ -923,6 +980,15 @@ def register():
         description="While the bridge runs, park actions on streamed objects "
                     "so baked keyframes don't fight the stream; restored on "
                     "Stop Bridge")
+    bpy.types.Scene.tdb_slave_timeline = bpy.props.BoolProperty(
+        name="Slave timeline to TD", default=False,
+        description="Follow TD's timeline frame (stamped on the stream): "
+                    "frame-accurate recording and deterministic playback. "
+                    "Leave Blender's own playback stopped while enabled")
+    bpy.types.Scene.tdb_smooth = bpy.props.FloatProperty(
+        name="Smoothing", default=0.0, min=0.0, max=0.95,
+        description="Exponential smoothing of streamed transforms "
+                    "(0 = off, higher = smoother/laggier)")
     bpy.types.Scene.tdb_udp_port = bpy.props.IntProperty(
         name="UDP port", default=9500, min=1024, max=65535)
     bpy.types.Scene.tdb_tcp_port = bpy.props.IntProperty(
@@ -952,7 +1018,8 @@ def unregister():
             bpy.utils.unregister_class(c)
         except RuntimeError:
             pass
-    for p in ("tdb_udp_port", "tdb_tcp_port", "tdb_live_mute", "tdb_fs_port",
+    for p in ("tdb_udp_port", "tdb_tcp_port", "tdb_live_mute",
+              "tdb_slave_timeline", "tdb_smooth", "tdb_fs_port",
               "tdb_fs_width", "tdb_fs_height", "tdb_fs_fps"):
         if hasattr(bpy.types.Scene, p):
             delattr(bpy.types.Scene, p)

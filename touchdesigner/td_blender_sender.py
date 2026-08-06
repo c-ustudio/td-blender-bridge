@@ -89,6 +89,7 @@ class _Net:
         self.next_try = 0.0
 
     def send_json(self, obj):
+        obj.update(_STAMP)   # TD master clock: timeline frame + absTime
         try:
             self.udp.sendto(json.dumps(obj).encode(), (HOST, UDP_PORT))
         except OSError:
@@ -123,6 +124,18 @@ class _Net:
 
 _net = _Net()
 _topo_cache = {}   # sop path -> (npoints, nprims)
+_STAMP = {}        # refreshed once per tick(); merged into every UDP message
+
+
+def _update_stamp():
+    """fr = component timeline frame (loops with the project timeline, drives
+    Blender's 'Slave timeline to TD'); tm = absTime.seconds (monotonic, used
+    for frame-accurate recording timestamps)."""
+    try:
+        _STAMP['fr'] = float(me.time.frame)
+    except Exception:
+        _STAMP['fr'] = float(absTime.frame)
+    _STAMP['tm'] = float(absTime.seconds)
 
 
 def _matrix16(m):
@@ -292,6 +305,7 @@ def tick():
     Each send is isolated so one bad source never stops the others;
     the most recent failure is kept in LAST_ERROR[0].
     """
+    _safe(_update_stamp)
     for td_path, bl_name in CAMERAS.items():
         _safe(send_camera, td_path, bl_name)
     for td_path, bl_name in XFORM_OBJS.items():

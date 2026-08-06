@@ -7,6 +7,19 @@ Three channels, all little-endian. Defaults: UDP 9500, TCP 9501, TCP 9502.
 One JSON object per datagram. Latest value wins; loss is acceptable by design
 (the next frame replaces it).
 
+Every message additionally carries the TD master clock (optional — old
+senders without them still work):
+
+```json
+{"fr": 245.0, "tm": 1234.567, ...}
+```
+
+- `fr` — TD component timeline frame (loops with the project timeline).
+  Drives Blender's optional **Slave timeline to TD** mode
+  (`scene.frame_current` follows it).
+- `tm` — TD `absTime.seconds` (monotonic). Used for frame-accurate
+  recording timestamps instead of Blender-side arrival time.
+
 ### Transform / camera
 
 ```json
