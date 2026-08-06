@@ -823,11 +823,35 @@ def _fs_capture():
         fb = _g.state.active_framebuffer_get()
         buf = fb.read_color(0, 0, w, h, 4, 0, 'UBYTE')
     buf.dimensions = w * h * 4
+    return _gpu_buf_bytes(buf, w * h * 4), w, h
+
+
+def _gpu_buf_bytes(buf, nbytes):
+    buf.dimensions = nbytes
     try:
         return bytes(memoryview(buf))
     except TypeError:
         import numpy as _np
         return _np.array(buf.to_list(), dtype=_np.uint8).tobytes()
+
+
+def _fs_grab_viewport():
+    """Read the viewport's already-rendered framebuffer instead of paying for
+    a second offscreen EEVEE render. Runs inside the draw callback, so the
+    active framebuffer IS the viewport being drawn. Frame size follows the
+    viewport; overlays/gizmos are included unless disabled in that viewport."""
+    import gpu
+    region = bpy.context.region
+    space = getattr(bpy.context, "space_data", None)
+    if region is None or space is None or space.type != 'VIEW_3D':
+        return None
+    w = region.width - (region.width % 2)
+    h = region.height - (region.height % 2)
+    if w < 8 or h < 8:
+        return None
+    fb = gpu.state.active_framebuffer_get()
+    buf = fb.read_color(0, 0, w, h, 4, 0, 'UBYTE')
+    return _gpu_buf_bytes(buf, w * h * 4), w, h
 
 
 def _fs_draw():
@@ -839,12 +863,15 @@ def _fs_draw():
         return
     S.fs_last_cap = now
     try:
-        pixels = _fs_capture()
+        if getattr(bpy.context.scene, "tdb_fs_mode", 'CAMERA') == 'VIEWPORT':
+            result = _fs_grab_viewport()
+        else:
+            result = _fs_capture()
     except Exception as e:
         S.fs_error = "capture: %s" % e
         return
-    if pixels is not None:
-        S.fs_latest = pixels
+    if result is not None:
+        S.fs_latest = result          # (pixels, w, h)
         S.fs_seq += 1
 
 
@@ -872,8 +899,7 @@ def _fs_tick():
     if S.fs_latest is None or S.fs_seq == S.fs_sent_seq:
         return S.fs_interval / 2
     S.fs_sent_seq = S.fs_seq
-    pixels = S.fs_latest
-    w, h = S.fs_size
+    pixels, w, h = S.fs_latest
     header = b"TDBF" + bytes([1, 1]) + struct.pack("<HH", w, h)
     payload = header + pixels
     packet = struct.pack("<I", len(payload)) + payload
@@ -1188,10 +1214,12 @@ class TDB_PT_panel(bpy.types.Panel):
         col.separator()
         box = col.box()
         box.label(text="EEVEE -> TD frames", icon='RENDER_ANIMATION')
+        box.prop(context.scene, "tdb_fs_mode", text="")
         box.prop(context.scene, "tdb_fs_port")
-        row = box.row()
-        row.prop(context.scene, "tdb_fs_width")
-        row.prop(context.scene, "tdb_fs_height")
+        if context.scene.tdb_fs_mode == 'CAMERA':
+            row = box.row()
+            row.prop(context.scene, "tdb_fs_width")
+            row.prop(context.scene, "tdb_fs_height")
         box.prop(context.scene, "tdb_fs_fps")
         if S.fs_running:
             box.operator("tdb.fs_stop", icon='PAUSE')
@@ -1236,6 +1264,16 @@ def register():
         name="UDP port", default=9500, min=1024, max=65535)
     bpy.types.Scene.tdb_tcp_port = bpy.props.IntProperty(
         name="TCP port", default=9501, min=1024, max=65535)
+    bpy.types.Scene.tdb_fs_mode = bpy.props.EnumProperty(
+        name="Capture", default='VIEWPORT',
+        items=(('VIEWPORT', "Viewport (fast)",
+                "Read the already-rendered viewport framebuffer - no second "
+                "render. Frame size follows the viewport; hide overlays in "
+                "the viewport for clean output"),
+               ('CAMERA', "Scene camera (offscreen)",
+                "Render the scene camera offscreen at the configured "
+                "resolution - exact size and framing, but pays for a full "
+                "second EEVEE render per frame")))
     bpy.types.Scene.tdb_fs_port = bpy.props.IntProperty(
         name="Frame port", default=9502, min=1024, max=65535)
     bpy.types.Scene.tdb_fs_width = bpy.props.IntProperty(
@@ -1262,8 +1300,8 @@ def unregister():
         except RuntimeError:
             pass
     for p in ("tdb_udp_port", "tdb_tcp_port", "tdb_live_mute",
-              "tdb_slave_timeline", "tdb_smooth", "tdb_fs_port",
-              "tdb_fs_width", "tdb_fs_height", "tdb_fs_fps"):
+              "tdb_slave_timeline", "tdb_smooth", "tdb_fs_mode",
+              "tdb_fs_port", "tdb_fs_width", "tdb_fs_height", "tdb_fs_fps"):
         if hasattr(bpy.types.Scene, p):
             delattr(bpy.types.Scene, p)
 
