@@ -89,8 +89,14 @@ Implemented on `phase2-geometry` as protocol v2 (v1 still parses):
   interactive viewport - users disable the frame server to get 60 fps back)
 - Stop rendering twice: grab the viewport's already-rendered framebuffer
   (overlays off = clean EEVEE) instead of a second offscreen render
-- Spout backend on Windows (zero-copy GPU, same-GPU only) with TCP as
-  portable/cross-machine fallback; requires the OpenGL backend in Blender
+- ~~Spout backend~~ implemented 2026-08-06 (pending live validation):
+  SpoutGL 0.1.1 (cp313 wheel, installed to the user scripts/modules dir -
+  no admin) shares frames from the draw callback; TD receives in the
+  component's Spout In TOP (Framesource par: tcp/spout). Current path is
+  sendImage (one readback remains, but no TCP / no TD-side upload);
+  true zero-copy sendTexture needs a GL texture handle Blender's gpu
+  module doesn't expose - revisit via ctypes GL queries. Requires the
+  OpenGL backend in Blender; TCP remains the cross-machine fallback
 - Latency budget & measurement (target < 3 frames end-to-end)
 - ~~TOP -> Blender textures~~ implemented 2026-08-06 (kind-4 frames,
   `TOP_OPS` / component Textop par -> Blender image datablock; pending

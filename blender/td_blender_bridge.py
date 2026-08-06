@@ -136,6 +136,11 @@ class _State:
         self.fs_draw_handle = None
         self.fs_latest = None      # last captured RGBA8 bytes
         self.fs_last_cap = 0.0
+        # Spout transport (Windows, OpenGL backend): shared-texture handoff
+        # to TD's Spout In TOP - no TCP, no TD-side upload
+        self.sp_sender = None
+        self.sp_name = ""
+        self.sp_error = ""
         self.fs_seq = 0            # bumped per capture
         self.fs_sent_seq = 0
 
@@ -891,9 +896,46 @@ def _fs_grab_viewport():
     return _gpu_buf_bytes(buf, w * h * 4), w, h
 
 
+GL_RGBA = 0x1908
+
+
+def _spout_send(pixels, w, h):
+    """Hand the frame to Spout (must run with a GL context current, i.e.
+    inside the draw callback). Sender is created lazily and re-created when
+    the name changes."""
+    name = getattr(bpy.context.scene, "tdb_spout_name", "TDBridge") or "TDBridge"
+    try:
+        import SpoutGL
+    except ImportError:
+        S.sp_error = "SpoutGL not installed in Blender's Python"
+        return
+    if S.sp_sender is None or S.sp_name != name:
+        if S.sp_sender is not None:
+            try:
+                S.sp_sender.releaseSender()
+            except Exception:
+                pass
+        S.sp_sender = SpoutGL.SpoutSender()
+        S.sp_sender.setSenderName(name)
+        S.sp_name = name
+        S.sp_error = ""
+    try:
+        S.sp_sender.sendImage(pixels, w, h, GL_RGBA, False, 0)
+        S.fs_frames += 1
+    except Exception as e:
+        S.sp_error = "spout send: %s" % e
+
+
+def _spout_active():
+    return getattr(bpy.context.scene, "tdb_fs_transport", 'TCP') == 'SPOUT'
+
+
 def _fs_draw():
     """View3D draw callback: capture at most once per fs_interval."""
-    if not S.fs_running or not S.fs_clients:
+    if not S.fs_running:
+        return
+    spout = _spout_active()
+    if not spout and not S.fs_clients:
         return
     now = time.time()
     if now - S.fs_last_cap < S.fs_interval * 0.9:
@@ -907,8 +949,12 @@ def _fs_draw():
     except Exception as e:
         S.fs_error = "capture: %s" % e
         return
-    if result is not None:
-        S.fs_latest = result          # (pixels, w, h)
+    if result is None:
+        return
+    if spout:
+        _spout_send(*result)          # GL context is current here
+    else:
+        S.fs_latest = result          # (pixels, w, h) -> TCP timer
         S.fs_seq += 1
 
 
@@ -982,9 +1028,11 @@ def start_frame_server(port=9502, width=960, height=540, fps=30):
         S.fs_sock.listen(4)
         S.fs_sock.setblocking(False)
     except OSError as e:
-        S.fs_error = "bind failed: %s" % e
         S.fs_sock = None
-        return False
+        if not _spout_active():
+            S.fs_error = "bind failed: %s" % e
+            return False
+        # Spout transport doesn't need the TCP socket; carry on without it
     S.fs_size = (int(width) // 4 * 4, int(height) // 4 * 4)
     S.fs_interval = 1.0 / max(1, fps)
     S.fs_running = True
@@ -1022,6 +1070,13 @@ def stop_frame_server():
     S.fs_sock = None
     S.fs_offscreen = None
     S.fs_latest = None
+    if S.sp_sender is not None:
+        try:
+            S.sp_sender.releaseSender()
+        except Exception:
+            pass
+        S.sp_sender = None
+        S.sp_name = ""
 
 
 # -- lifecycle ---------------------------------------------------------------
@@ -1251,8 +1306,12 @@ class TDB_PT_panel(bpy.types.Panel):
         col.separator()
         box = col.box()
         box.label(text="EEVEE -> TD frames", icon='RENDER_ANIMATION')
+        box.prop(context.scene, "tdb_fs_transport", text="")
         box.prop(context.scene, "tdb_fs_mode", text="")
-        box.prop(context.scene, "tdb_fs_port")
+        if context.scene.tdb_fs_transport == 'SPOUT':
+            box.prop(context.scene, "tdb_spout_name")
+        else:
+            box.prop(context.scene, "tdb_fs_port")
         if context.scene.tdb_fs_mode == 'CAMERA':
             row = box.row()
             row.prop(context.scene, "tdb_fs_width")
@@ -1260,12 +1319,17 @@ class TDB_PT_panel(bpy.types.Panel):
         box.prop(context.scene, "tdb_fs_fps")
         if S.fs_running:
             box.operator("tdb.fs_stop", icon='PAUSE')
-            box.label(text="%d clients, %d frames sent"
-                      % (len(S.fs_clients), S.fs_frames))
+            if context.scene.tdb_fs_transport == 'SPOUT':
+                box.label(text="%d frames shared" % S.fs_frames)
+            else:
+                box.label(text="%d clients, %d frames sent"
+                          % (len(S.fs_clients), S.fs_frames))
         else:
             box.operator("tdb.fs_start", icon='PLAY')
         if S.fs_error:
             box.label(text=S.fs_error[:64], icon='ERROR')
+        if S.sp_error:
+            box.label(text=S.sp_error[:64], icon='ERROR')
 
 
 _classes = (TDB_OT_start, TDB_OT_stop, TDB_OT_record, TDB_OT_bake,
@@ -1301,6 +1365,18 @@ def register():
         name="UDP port", default=9500, min=1024, max=65535)
     bpy.types.Scene.tdb_tcp_port = bpy.props.IntProperty(
         name="TCP port", default=9501, min=1024, max=65535)
+    bpy.types.Scene.tdb_fs_transport = bpy.props.EnumProperty(
+        name="Transport", default='SPOUT',
+        items=(('SPOUT', "Spout (GPU sharing)",
+                "Share frames via Spout - TD receives them in a Spout In "
+                "TOP with no TCP and no TD-side upload. Windows + OpenGL "
+                "backend, same machine. Needs the SpoutGL Python module"),
+               ('TCP', "TCP (portable)",
+                "Push frames over TCP port; works cross-machine and on any "
+                "backend")))
+    bpy.types.Scene.tdb_spout_name = bpy.props.StringProperty(
+        name="Sender name", default="TDBridge",
+        description="Spout sender name; select it in TD's Spout In TOP")
     bpy.types.Scene.tdb_fs_mode = bpy.props.EnumProperty(
         name="Capture", default='VIEWPORT',
         items=(('VIEWPORT', "Viewport (fast)",
@@ -1337,8 +1413,9 @@ def unregister():
         except RuntimeError:
             pass
     for p in ("tdb_udp_port", "tdb_tcp_port", "tdb_live_mute",
-              "tdb_slave_timeline", "tdb_smooth", "tdb_fs_mode",
-              "tdb_fs_port", "tdb_fs_width", "tdb_fs_height", "tdb_fs_fps"):
+              "tdb_slave_timeline", "tdb_smooth", "tdb_fs_transport",
+              "tdb_spout_name", "tdb_fs_mode", "tdb_fs_port",
+              "tdb_fs_width", "tdb_fs_height", "tdb_fs_fps"):
         if hasattr(bpy.types.Scene, p):
             delattr(bpy.types.Scene, p)
 
