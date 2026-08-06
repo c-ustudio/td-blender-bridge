@@ -1,0 +1,795 @@
+bl_info = {
+    "name": "TouchDesigner Bridge (TD -> Blender)",
+    "author": "enric + Claude",
+    "version": (0, 2, 0),
+    "blender": (4, 2, 0),
+    "location": "3D Viewport > Sidebar > TD Bridge",
+    "description": "Two-way realtime bridge with TouchDesigner: drive cameras, transforms, params and geometry from TD (UDP/TCP), stream EEVEE frames back to TD, record & bake to keyframes",
+    "category": "Import-Export",
+}
+
+# ---------------------------------------------------------------------------
+# Protocol
+#
+# UDP (default port 9500) - small, per-frame JSON datagrams:
+#   {"t":"xform","n":"<object name>","m":[16 floats row-major TD world matrix],
+#    "cam":{"fov":45.0}}            # "cam" key present => object is a camera
+#   {"t":"param","n":"<object>","p":"data.energy","v":5.0}
+#   {"t":"params","d":[["<object>","<datapath>",value], ...]}   # batch
+#
+# TCP (default port 9501) - length-prefixed binary geometry frames:
+#   [u32 payload_len][payload]
+#   payload: b"TDBG" u8 version u8 kind u16 name_len name(utf8) body
+#     kind 1 = points: u32 count, u8 has_color,
+#                      count*3 f32 positions [, count*4 f32 colors]
+#     kind 2 = mesh:   u32 nverts, u32 ntris,
+#                      nverts*3 f32 positions, ntris*3 u32 indices
+#
+# TCP (default port 9502) - frame server (Blender -> TD), push stream:
+#   [u32 payload_len][payload]
+#   payload: b"TDBF" u8 version u8 fmt(1=RGBA8) u16 w u16 h pixels
+#   EEVEE viewport is rendered offscreen through the scene camera and pushed
+#   to every connected client (TD's blender_receiver DAT + Script TOP).
+#
+# Coordinates: TD is y-up / -z forward, Blender is z-up. All incoming data is
+# in TD space; converted here (x, y, z)td -> (x, -z, y)blender.
+# ---------------------------------------------------------------------------
+
+import bpy
+import json
+import math
+import socket
+import select
+import struct
+import threading
+import time
+import numpy as np
+from mathutils import Matrix
+
+# -- coordinate conversion ---------------------------------------------------
+
+C4 = Matrix(((1, 0, 0, 0),
+             (0, 0, -1, 0),
+             (0, 1, 0, 0),
+             (0, 0, 0, 1)))
+C4i = C4.inverted()
+
+
+def td_matrix_to_blender(v, view_convention=False):
+    """Convert a TD world matrix (16 floats, row-major) to Blender.
+
+    view_convention=True is for cameras/lights: preserves the object's local
+    -Z as the view direction and +Y as up (TD and Blender share the OpenGL
+    camera convention, but a plain change-of-basis conjugation would remap
+    which local axis is 'forward').
+    """
+    m = Matrix((v[0:4], v[4:8], v[8:12], v[12:16]))
+    if view_convention:
+        return C4 @ m
+    return C4 @ m @ C4i
+
+
+def td_points_to_blender(pos):
+    """pos: (N,3) float32 numpy array in TD space -> new array in Blender space."""
+    out = np.empty_like(pos)
+    out[:, 0] = pos[:, 0]
+    out[:, 1] = -pos[:, 2]
+    out[:, 2] = pos[:, 1]
+    return out
+
+
+# -- shared state ------------------------------------------------------------
+
+class _State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running = False
+        self.thread = None
+        self.udp = None
+        self.tcp = None
+        self.conns = []
+        self.bufs = {}
+        # latest-value stores (reader thread writes, timer reads)
+        self.xforms = {}   # name -> (vals16, camdict|None)
+        self.params = {}   # (name, path) -> value
+        self.geo = {}      # name -> dict(kind=, pos=bytes, tris=bytes|None, n=, ncol=)
+        self.dirty_x = set()
+        self.dirty_p = set()
+        self.dirty_g = set()
+        # stats
+        self.pkts = 0
+        self.pps = 0.0
+        self._pps_t = time.time()
+        self._pps_n = 0
+        self.last_error = ""
+        # recording
+        self.record = False
+        self.rec_t0 = None
+        self.rec = []      # (t, {name: (vals16, camdict)}, {(name,path): value})
+        # frame server (Blender -> TD)
+        self.fs_sock = None
+        self.fs_clients = []
+        self.fs_pending = {}   # client -> bytearray still to flush
+        self.fs_running = False
+        self.fs_offscreen = None
+        self.fs_size = (960, 540)
+        self.fs_interval = 1.0 / 30.0
+        self.fs_frames = 0
+        self.fs_error = ""
+
+
+S = _State()
+
+
+# -- reader thread (sockets only, never touches bpy) -------------------------
+
+def _handle_udp(data):
+    try:
+        msg = json.loads(data)
+    except Exception:
+        return
+    t = msg.get("t")
+    with S.lock:
+        if t == "xform":
+            S.xforms[msg["n"]] = (msg["m"], msg.get("cam"))
+            S.dirty_x.add(msg["n"])
+        elif t == "param":
+            S.params[(msg["n"], msg["p"])] = msg["v"]
+            S.dirty_p.add((msg["n"], msg["p"]))
+        elif t == "params":
+            for n, p, v in msg.get("d", []):
+                S.params[(n, p)] = v
+                S.dirty_p.add((n, p))
+        S.pkts += 1
+        S._pps_n += 1
+
+
+def _handle_tcp_frame(payload):
+    if len(payload) < 8 or payload[0:4] != b"TDBG":
+        return
+    kind = payload[5]
+    (name_len,) = struct.unpack_from("<H", payload, 6)
+    name = payload[8:8 + name_len].decode("utf-8", "replace")
+    off = 8 + name_len
+    try:
+        if kind == 1:  # points
+            n, has_col = struct.unpack_from("<IB", payload, off)
+            off += 5
+            pos = payload[off:off + n * 12]
+            off += n * 12
+            col = payload[off:off + n * 16] if has_col else None
+            g = {"kind": 1, "n": n, "pos": pos, "col": col, "tris": None}
+        elif kind == 2:  # mesh
+            nv, nt = struct.unpack_from("<II", payload, off)
+            off += 8
+            pos = payload[off:off + nv * 12]
+            off += nv * 12
+            tris = payload[off:off + nt * 12]
+            g = {"kind": 2, "n": nv, "nt": nt, "pos": pos, "tris": tris, "col": None}
+        else:
+            return
+    except struct.error:
+        return
+    with S.lock:
+        S.geo[name] = g
+        S.dirty_g.add(name)
+        S.pkts += 1
+        S._pps_n += 1
+
+
+def _drain_conn(conn):
+    buf = S.bufs[conn]
+    while True:
+        if len(buf) < 4:
+            return
+        (plen,) = struct.unpack_from("<I", buf, 0)
+        if plen > 256 * 1024 * 1024:      # insane frame -> drop connection buffer
+            buf.clear()
+            return
+        if len(buf) < 4 + plen:
+            return
+        _handle_tcp_frame(bytes(buf[4:4 + plen]))
+        del buf[:4 + plen]
+
+
+def _reader():
+    while S.running:
+        socks = [s for s in (S.udp, S.tcp) if s] + list(S.conns)
+        try:
+            r, _, _ = select.select(socks, [], [], 0.05)
+        except OSError:
+            break
+        for s in r:
+            if s is S.udp:
+                try:
+                    while True:
+                        data, _ = S.udp.recvfrom(65535)
+                        _handle_udp(data)
+                except (BlockingIOError, OSError):
+                    pass
+            elif s is S.tcp:
+                try:
+                    c, _ = S.tcp.accept()
+                    c.setblocking(False)
+                    S.conns.append(c)
+                    S.bufs[c] = bytearray()
+                except OSError:
+                    pass
+            else:
+                try:
+                    chunk = s.recv(1 << 22)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    try:
+                        S.conns.remove(s)
+                        del S.bufs[s]
+                        s.close()
+                    except (ValueError, KeyError, OSError):
+                        pass
+                    continue
+                S.bufs[s] += chunk
+                _drain_conn(s)
+
+
+# -- main-thread apply (bpy work) --------------------------------------------
+
+def _ensure_object(name, camdict):
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        if camdict is not None:
+            data = bpy.data.cameras.new(name)
+            obj = bpy.data.objects.new(name, data)
+        else:
+            obj = bpy.data.objects.new(name, None)
+            obj.empty_display_size = 0.3
+        bpy.context.scene.collection.objects.link(obj)
+    return obj
+
+
+def _apply_camera_props(obj, camdict):
+    if obj.type != 'CAMERA' or not camdict:
+        return
+    cam = obj.data
+    fov = camdict.get("fov")
+    if fov:
+        cam.sensor_fit = 'HORIZONTAL'
+        cam.lens = (cam.sensor_width / 2.0) / math.tan(math.radians(fov) / 2.0)
+    if "near" in camdict:
+        cam.clip_start = max(0.001, camdict["near"])
+    if "far" in camdict:
+        cam.clip_end = camdict["far"]
+
+
+def _set_param(name, path, value):
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        return
+    holder = obj
+    parts = path.split(".")
+    try:
+        for p in parts[:-1]:
+            holder = holder[int(p)] if p.isdigit() else getattr(holder, p)
+        last = parts[-1]
+        if last.isdigit():
+            holder[int(last)] = value
+        else:
+            cur = getattr(holder, last)
+            # allow scalar broadcast into vectors/colors
+            if hasattr(cur, "__len__") and not hasattr(value, "__len__"):
+                setattr(holder, last, [value] * len(cur))
+            else:
+                setattr(holder, last, value)
+    except Exception as e:
+        S.last_error = f"param {name}.{path}: {e}"
+
+
+def _update_geo(name):
+    g = S.geo.get(name)
+    if not g:
+        return
+    n = g["n"]
+    me = bpy.data.meshes.get("TDB_" + name)
+    if me is None:
+        me = bpy.data.meshes.new("TDB_" + name)
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        obj = bpy.data.objects.new(name, me)
+        bpy.context.scene.collection.objects.link(obj)
+    elif obj.data is not me:
+        obj.data = me
+
+    pos = np.frombuffer(g["pos"], dtype=np.float32).reshape(-1, 3)[:n]
+    pos = td_points_to_blender(pos).astype(np.float32)
+
+    if g["kind"] == 1:  # points
+        if len(me.vertices) == n and len(me.polygons) == 0:
+            me.vertices.foreach_set("co", pos.ravel())
+            me.update()
+        else:
+            me.clear_geometry()
+            me.from_pydata(pos.tolist(), [], [])
+        if g["col"] is not None:
+            col = np.frombuffer(g["col"], dtype=np.float32).reshape(-1, 4)[:n]
+            attr = me.attributes.get("td_color")
+            if attr is None or len(attr.data) != n:
+                if attr is not None:
+                    me.attributes.remove(attr)
+                attr = me.attributes.new("td_color", 'FLOAT_COLOR', 'POINT')
+            attr.data.foreach_set("color", col.ravel())
+    else:  # mesh
+        nt = g["nt"]
+        tris = np.frombuffer(g["tris"], dtype=np.uint32).reshape(-1, 3)[:nt]
+        same_topo = (len(me.vertices) == n and len(me.polygons) == nt
+                     and me.get("tdb_topo") == int(n * 100003 + nt))
+        if same_topo:
+            me.vertices.foreach_set("co", pos.ravel())
+            me.update()
+        else:
+            me.clear_geometry()
+            me.from_pydata(pos.tolist(), [], tris.tolist())
+            me["tdb_topo"] = int(n * 100003 + nt)
+        me.update()
+
+
+def _redraw():
+    wm = bpy.data.window_managers[0]
+    for w in wm.windows:
+        for a in w.screen.areas:
+            if a.type == 'VIEW_3D':
+                a.tag_redraw()
+
+
+def _apply():
+    if not S.running:
+        return None
+    with S.lock:
+        dx = {n: S.xforms[n] for n in S.dirty_x}
+        dp = {k: S.params[k] for k in S.dirty_p}
+        dg = set(S.dirty_g)
+        S.dirty_x.clear()
+        S.dirty_p.clear()
+        S.dirty_g.clear()
+        now = time.time()
+        if now - S._pps_t >= 1.0:
+            S.pps = S._pps_n / (now - S._pps_t)
+            S._pps_n = 0
+            S._pps_t = now
+
+    changed = bool(dx or dp or dg)
+    try:
+        for name, (vals, camdict) in dx.items():
+            obj = _ensure_object(name, camdict)
+            view = camdict is not None or obj.type in ('CAMERA', 'LIGHT')
+            obj.matrix_world = td_matrix_to_blender(vals, view)
+            _apply_camera_props(obj, camdict)
+        for (name, path), v in dp.items():
+            _set_param(name, path, v)
+        for name in dg:
+            _update_geo(name)
+    except Exception as e:
+        S.last_error = str(e)
+
+    if S.record and changed:
+        with S.lock:
+            t = time.time() - S.rec_t0
+            S.rec.append((t, dict(dx), dict(dp)))
+
+    if changed:
+        _redraw()
+    return 1.0 / 60.0
+
+
+# -- frame server: EEVEE viewport -> TD -------------------------------------
+
+def _fs_find_view3d():
+    for win in bpy.data.window_managers[0].windows:
+        for a in win.screen.areas:
+            if a.type == 'VIEW_3D':
+                region = next((r for r in a.regions if r.type == 'WINDOW'), None)
+                if region:
+                    return a.spaces.active, region
+    return None, None
+
+
+def _fs_capture():
+    """Render the scene camera offscreen (EEVEE viewport shading) -> RGBA8."""
+    import gpu
+    scene = bpy.context.scene
+    cam = scene.camera
+    if cam is None:
+        return None
+    w, h = S.fs_size
+    space, region = _fs_find_view3d()
+    if space is None:
+        return None
+    if (S.fs_offscreen is None
+            or S.fs_offscreen.width != w or S.fs_offscreen.height != h):
+        S.fs_offscreen = gpu.types.GPUOffScreen(w, h)
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    vm = cam.matrix_world.inverted()
+    pm = cam.calc_matrix_camera(depsgraph, x=w, y=h)
+    try:
+        S.fs_offscreen.draw_view3d(scene, bpy.context.view_layer, space, region,
+                                   vm, pm, do_color_management=True)
+    except TypeError:  # older signature
+        S.fs_offscreen.draw_view3d(scene, bpy.context.view_layer, space, region,
+                                   vm, pm)
+    with S.fs_offscreen.bind():
+        import gpu as _g
+        fb = _g.state.active_framebuffer_get()
+        buf = fb.read_color(0, 0, w, h, 4, 0, 'UBYTE')
+    buf.dimensions = w * h * 4
+    try:
+        return bytes(memoryview(buf))
+    except TypeError:
+        import numpy as _np
+        return _np.array(buf.to_list(), dtype=_np.uint8).tobytes()
+
+
+def _fs_tick():
+    if not S.fs_running:
+        return None
+    # accept new clients (non-blocking)
+    while S.fs_sock is not None:
+        try:
+            c, _ = S.fs_sock.accept()
+            c.setblocking(False)
+            try:
+                c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            S.fs_clients.append(c)
+            S.fs_pending[c] = bytearray()
+        except (BlockingIOError, OSError):
+            break
+    if not S.fs_clients:
+        return S.fs_interval
+    try:
+        pixels = _fs_capture()
+    except Exception as e:
+        S.fs_error = "capture: %s" % e
+        return S.fs_interval
+    if pixels is None:
+        return S.fs_interval
+    w, h = S.fs_size
+    header = b"TDBF" + bytes([1, 1]) + struct.pack("<HH", w, h)
+    payload = header + pixels
+    packet = struct.pack("<I", len(payload)) + payload
+    S.fs_frames += 1
+    for c in list(S.fs_clients):
+        pending = S.fs_pending.get(c)
+        if pending is None:
+            continue
+        if len(pending) == 0:
+            pending += packet          # queue this frame
+        elif len(pending) > 32 * len(packet):
+            _fs_drop(c)                # client hopelessly behind
+            continue
+        # else: client still draining a previous frame -> drop this frame for it
+        try:
+            sent = c.send(pending)
+            del pending[:sent]
+        except BlockingIOError:
+            pass
+        except OSError:
+            _fs_drop(c)
+    return S.fs_interval
+
+
+def _fs_drop(c):
+    try:
+        S.fs_clients.remove(c)
+    except ValueError:
+        pass
+    S.fs_pending.pop(c, None)
+    try:
+        c.close()
+    except OSError:
+        pass
+
+
+def start_frame_server(port=9502, width=960, height=540, fps=30):
+    stop_frame_server()
+    try:
+        S.fs_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        S.fs_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        S.fs_sock.bind(("0.0.0.0", port))
+        S.fs_sock.listen(4)
+        S.fs_sock.setblocking(False)
+    except OSError as e:
+        S.fs_error = "bind failed: %s" % e
+        S.fs_sock = None
+        return False
+    S.fs_size = (int(width) // 4 * 4, int(height) // 4 * 4)
+    S.fs_interval = 1.0 / max(1, fps)
+    S.fs_running = True
+    S.fs_frames = 0
+    S.fs_error = ""
+    bpy.app.timers.register(_fs_tick, first_interval=0.1)
+    return True
+
+
+def stop_frame_server():
+    S.fs_running = False
+    try:
+        if bpy.app.timers.is_registered(_fs_tick):
+            bpy.app.timers.unregister(_fs_tick)
+    except Exception:
+        pass
+    for c in list(S.fs_clients):
+        _fs_drop(c)
+    if S.fs_sock:
+        try:
+            S.fs_sock.close()
+        except OSError:
+            pass
+    S.fs_sock = None
+    S.fs_offscreen = None
+
+
+# -- lifecycle ---------------------------------------------------------------
+
+def start_bridge(udp_port=9500, tcp_port=9501):
+    stop_bridge()
+    S.running = True
+    S.last_error = ""
+    try:
+        S.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        S.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        S.udp.bind(("0.0.0.0", udp_port))
+        S.udp.setblocking(False)
+        S.tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        S.tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        S.tcp.bind(("0.0.0.0", tcp_port))
+        S.tcp.listen(4)
+        S.tcp.setblocking(False)
+    except OSError as e:
+        S.last_error = f"bind failed: {e}"
+        S.running = False
+        for s in (S.udp, S.tcp):
+            if s:
+                s.close()
+        S.udp = S.tcp = None
+        return False
+    S.thread = threading.Thread(target=_reader, daemon=True)
+    S.thread.start()
+    bpy.app.timers.register(_apply, first_interval=0.05)
+    return True
+
+
+def stop_bridge():
+    S.running = False
+    try:
+        if bpy.app.timers.is_registered(_apply):
+            bpy.app.timers.unregister(_apply)
+    except Exception:
+        pass
+    for s in [S.udp, S.tcp] + S.conns:
+        try:
+            if s:
+                s.close()
+        except OSError:
+            pass
+    S.udp = S.tcp = None
+    S.conns = []
+    S.bufs = {}
+    if S.thread and S.thread.is_alive():
+        S.thread.join(timeout=0.5)
+    S.thread = None
+
+
+def start_recording():
+    with S.lock:
+        S.rec = []
+        S.rec_t0 = time.time()
+        S.record = True
+
+
+def stop_recording():
+    with S.lock:
+        S.record = False
+
+
+def bake_recording(frame_start=1):
+    """Bake recorded transform/param samples to keyframes at scene fps."""
+    scene = bpy.context.scene
+    fps = scene.render.fps / scene.render.fps_base
+    with S.lock:
+        samples = list(S.rec)
+    if not samples:
+        return 0
+    per_frame = {}
+    for t, dx, dp in samples:
+        per_frame[int(round(t * fps)) + frame_start] = (dx, dp)
+    for frame in sorted(per_frame):
+        dx, dp = per_frame[frame]
+        scene.frame_set(frame)
+        for name, (vals, camdict) in dx.items():
+            obj = _ensure_object(name, camdict)
+            view = camdict is not None or obj.type in ('CAMERA', 'LIGHT')
+            obj.matrix_world = td_matrix_to_blender(vals, view)
+            obj.keyframe_insert("location", frame=frame)
+            obj.keyframe_insert("rotation_euler", frame=frame)
+            obj.keyframe_insert("scale", frame=frame)
+            if camdict:
+                _apply_camera_props(obj, camdict)
+                obj.data.keyframe_insert("lens", frame=frame)
+        for (name, path), v in dp.items():
+            _set_param(name, path, v)
+            obj = bpy.data.objects.get(name)
+            if obj is None:
+                continue
+            holder, attr = obj, path
+            if "." in path:
+                head, attr = path.rsplit(".", 1)
+                try:
+                    for p in head.split("."):
+                        holder = holder[int(p)] if p.isdigit() else getattr(holder, p)
+                except Exception:
+                    continue
+            try:
+                holder.keyframe_insert(attr, frame=frame)
+            except Exception:
+                pass
+    scene.frame_end = max(scene.frame_end, max(per_frame))
+    return len(per_frame)
+
+
+# -- UI ----------------------------------------------------------------------
+
+class TDB_OT_start(bpy.types.Operator):
+    bl_idname = "tdb.start"
+    bl_label = "Start Bridge"
+
+    def execute(self, context):
+        ok = start_bridge(context.scene.tdb_udp_port, context.scene.tdb_tcp_port)
+        if not ok:
+            self.report({'ERROR'}, S.last_error or "failed to start")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class TDB_OT_stop(bpy.types.Operator):
+    bl_idname = "tdb.stop"
+    bl_label = "Stop Bridge"
+
+    def execute(self, context):
+        stop_bridge()
+        return {'FINISHED'}
+
+
+class TDB_OT_record(bpy.types.Operator):
+    bl_idname = "tdb.record"
+    bl_label = "Record"
+
+    def execute(self, context):
+        if S.record:
+            stop_recording()
+        else:
+            start_recording()
+        return {'FINISHED'}
+
+
+class TDB_OT_bake(bpy.types.Operator):
+    bl_idname = "tdb.bake"
+    bl_label = "Bake Recording to Keyframes"
+
+    def execute(self, context):
+        n = bake_recording(context.scene.frame_start)
+        self.report({'INFO'}, f"baked {n} frames")
+        return {'FINISHED'}
+
+
+class TDB_OT_fs_start(bpy.types.Operator):
+    bl_idname = "tdb.fs_start"
+    bl_label = "Start Frame Server"
+
+    def execute(self, context):
+        sc = context.scene
+        ok = start_frame_server(sc.tdb_fs_port, sc.tdb_fs_width,
+                                sc.tdb_fs_height, sc.tdb_fs_fps)
+        if not ok:
+            self.report({'ERROR'}, S.fs_error or "failed to start")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class TDB_OT_fs_stop(bpy.types.Operator):
+    bl_idname = "tdb.fs_stop"
+    bl_label = "Stop Frame Server"
+
+    def execute(self, context):
+        stop_frame_server()
+        return {'FINISHED'}
+
+
+class TDB_PT_panel(bpy.types.Panel):
+    bl_label = "TD Bridge"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "TD Bridge"
+
+    def draw(self, context):
+        lay = self.layout
+        col = lay.column()
+        col.prop(context.scene, "tdb_udp_port")
+        col.prop(context.scene, "tdb_tcp_port")
+        if S.running:
+            col.operator("tdb.stop", icon='PAUSE')
+            col.label(text=f"running - {S.pps:.0f} msg/s, {S.pkts} total")
+        else:
+            col.operator("tdb.start", icon='PLAY')
+            col.label(text="stopped")
+        col.separator()
+        col.operator("tdb.record",
+                     text=("Stop Recording" if S.record else "Start Recording"),
+                     icon='REC')
+        if S.rec:
+            col.label(text=f"{len(S.rec)} samples recorded")
+            col.operator("tdb.bake", icon='KEY_HLT')
+        if S.last_error:
+            col.label(text=S.last_error[:64], icon='ERROR')
+
+        col.separator()
+        box = col.box()
+        box.label(text="EEVEE -> TD frames", icon='RENDER_ANIMATION')
+        box.prop(context.scene, "tdb_fs_port")
+        row = box.row()
+        row.prop(context.scene, "tdb_fs_width")
+        row.prop(context.scene, "tdb_fs_height")
+        box.prop(context.scene, "tdb_fs_fps")
+        if S.fs_running:
+            box.operator("tdb.fs_stop", icon='PAUSE')
+            box.label(text="%d clients, %d frames sent"
+                      % (len(S.fs_clients), S.fs_frames))
+        else:
+            box.operator("tdb.fs_start", icon='PLAY')
+        if S.fs_error:
+            box.label(text=S.fs_error[:64], icon='ERROR')
+
+
+_classes = (TDB_OT_start, TDB_OT_stop, TDB_OT_record, TDB_OT_bake,
+            TDB_OT_fs_start, TDB_OT_fs_stop, TDB_PT_panel)
+
+
+def register():
+    bpy.types.Scene.tdb_udp_port = bpy.props.IntProperty(
+        name="UDP port", default=9500, min=1024, max=65535)
+    bpy.types.Scene.tdb_tcp_port = bpy.props.IntProperty(
+        name="TCP port", default=9501, min=1024, max=65535)
+    bpy.types.Scene.tdb_fs_port = bpy.props.IntProperty(
+        name="Frame port", default=9502, min=1024, max=65535)
+    bpy.types.Scene.tdb_fs_width = bpy.props.IntProperty(
+        name="W", default=960, min=64, max=4096)
+    bpy.types.Scene.tdb_fs_height = bpy.props.IntProperty(
+        name="H", default=540, min=64, max=4096)
+    bpy.types.Scene.tdb_fs_fps = bpy.props.IntProperty(
+        name="FPS", default=30, min=1, max=120)
+    for c in _classes:
+        bpy.utils.register_class(c)
+
+    def _stop_all():
+        stop_bridge()
+        stop_frame_server()
+    bpy.app.driver_namespace["tdb_stop"] = _stop_all
+
+
+def unregister():
+    stop_bridge()
+    stop_frame_server()
+    for c in reversed(_classes):
+        try:
+            bpy.utils.unregister_class(c)
+        except RuntimeError:
+            pass
+    for p in ("tdb_udp_port", "tdb_tcp_port", "tdb_fs_port",
+              "tdb_fs_width", "tdb_fs_height", "tdb_fs_fps"):
+        if hasattr(bpy.types.Scene, p):
+            delattr(bpy.types.Scene, p)
+
+
+if __name__ == "__main__":
+    register()
