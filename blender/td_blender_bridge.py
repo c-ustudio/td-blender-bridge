@@ -311,6 +311,66 @@ def _set_param(name, path, value):
         S.last_error = f"param {name}.{path}: {e}"
 
 
+def _ensure_points_material():
+    mat = bpy.data.materials.get("TDB_Points")
+    if mat is None:
+        mat = bpy.data.materials.new("TDB_Points")
+        mat.use_nodes = True
+        nt = mat.node_tree
+        bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+        if bsdf is not None:
+            attr = nt.nodes.new('ShaderNodeAttribute')
+            attr.attribute_name = "td_color"
+            attr.location = (bsdf.location.x - 300, bsdf.location.y)
+            nt.links.new(attr.outputs['Color'], bsdf.inputs['Base Color'])
+            try:  # a touch of emission so points read in dark scenes
+                nt.links.new(attr.outputs['Color'],
+                             bsdf.inputs['Emission Color'])
+                bsdf.inputs['Emission Strength'].default_value = 0.5
+            except KeyError:
+                pass
+    return mat
+
+
+def _ensure_points_setup(obj):
+    """First arrival of a points object: instance spheres on the vertices via
+    Geometry Nodes and shade them from td_color, so streamed point clouds are
+    visible in EEVEE renders (bare vertices only show in the viewport)."""
+    if obj.modifiers.get("TDB Points") is not None:
+        return
+    ng = bpy.data.node_groups.get("TDB_Points")
+    if ng is None:
+        ng = bpy.data.node_groups.new("TDB_Points", 'GeometryNodeTree')
+        ng.interface.new_socket("Geometry", in_out='INPUT',
+                                socket_type='NodeSocketGeometry')
+        ng.interface.new_socket("Geometry", in_out='OUTPUT',
+                                socket_type='NodeSocketGeometry')
+        rad = ng.interface.new_socket("Radius", in_out='INPUT',
+                                      socket_type='NodeSocketFloat')
+        rad.default_value = 0.02
+        rad.min_value = 0.0
+        n_in = ng.nodes.new('NodeGroupInput')
+        n_in.location = (-400, 0)
+        ico = ng.nodes.new('GeometryNodeMeshIcoSphere')
+        ico.location = (-400, -160)
+        ico.inputs['Subdivisions'].default_value = 1
+        iop = ng.nodes.new('GeometryNodeInstanceOnPoints')
+        iop.location = (-180, 0)
+        setmat = ng.nodes.new('GeometryNodeSetMaterial')
+        setmat.location = (40, 0)
+        setmat.inputs['Material'].default_value = _ensure_points_material()
+        n_out = ng.nodes.new('NodeGroupOutput')
+        n_out.location = (260, 0)
+        ng.links.new(n_in.outputs['Geometry'], iop.inputs['Points'])
+        ng.links.new(n_in.outputs['Radius'], ico.inputs['Radius'])
+        ng.links.new(ico.outputs['Mesh'], iop.inputs['Instance'])
+        ng.links.new(iop.outputs['Instances'], setmat.inputs['Geometry'])
+        ng.links.new(setmat.outputs['Geometry'], n_out.inputs['Geometry'])
+    mod = obj.modifiers.new("TDB Points", 'NODES')
+    if mod is not None:
+        mod.node_group = ng
+
+
 def _update_geo(name):
     g = S.geo.get(name)
     if not g:
@@ -325,6 +385,8 @@ def _update_geo(name):
         bpy.context.scene.collection.objects.link(obj)
     elif obj.data is not me:
         obj.data = me
+    if g["kind"] == 1:
+        _ensure_points_setup(obj)
 
     pos = np.frombuffer(g["pos"], dtype=np.float32).reshape(-1, 3)[:n]
     pos = td_points_to_blender(pos).astype(np.float32)
