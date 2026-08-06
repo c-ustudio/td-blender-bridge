@@ -82,19 +82,30 @@ Implemented on `phase2-geometry` as protocol v2 (v1 still parses):
 - Deferred: chunked/partial mesh updates — revisit if a real bottleneck
   shows; TCP framing + compression cover current sizes
 
-## Phase 3 — Frames back to TD, properly
+## Phase 3 — Frames back to TD, properly ← NEXT
 
-- Validate the TCP RGBA path live (code shipped in v0.2.0)
+- ~~Validate the TCP RGBA path live~~ done 2026-08-06 (~24-27 fps at
+  960x540/30; measured: the double EEVEE render + readback also drags the
+  interactive viewport - users disable the frame server to get 60 fps back)
+- Stop rendering twice: grab the viewport's already-rendered framebuffer
+  (overlays off = clean EEVEE) instead of a second offscreen render
+- Spout backend on Windows (zero-copy GPU, same-GPU only) with TCP as
+  portable/cross-machine fallback; requires the OpenGL backend in Blender
 - Latency budget & measurement (target < 3 frames end-to-end)
-- Spout backend on Windows (zero-copy GPU) with TCP as portable fallback
+- TOP -> Blender textures: stream TD TOPs into Blender image datablocks
+  (drive materials/world from TD; mirror of the frame server)
+- POP direct readback: today POPs work via POP->CHOP (tx/ty/tz...);
+  investigate reading POP buffers directly to skip the CHOP hop
 - Optional depth/AOV passes for TD-side compositing
 
 ## Phase 4 — Packaging & DX
 
 - Blender: extension-format packaging (blender_manifest.toml), prefs UI,
   auto-start option
-- TD: single .tox component (custom parameters for ports/mappings instead of
-  editing CONFIG in a DAT)
+- ~~TD: single .tox component~~ done early (2026-08-06):
+  `touchdesigner/TDBridge.tox` - Bridge parameter page (host/ports/sources/
+  Active/Receive Frames toggles), param_map table for CHOP-channel ->
+  Blender-datapath mapping, out1 TOP carrying returned frames
 - Example .toe + .blend pair; CI (ruff + headless Blender smoke test)
 
 ## Workflow from here
