@@ -44,6 +44,7 @@ import struct
 import threading
 import time
 import numpy as np
+from bpy.app.handlers import persistent
 from mathutils import Matrix
 
 # -- coordinate conversion ---------------------------------------------------
@@ -89,7 +90,7 @@ class _State:
         self.tcp = None
         self.conns = []
         self.bufs = {}
-        # latest-value stores (reader thread writes, timer reads)
+        # latest-value stores (reader thread writes, main thread drains)
         self.xforms = {}   # name -> (vals16, camdict|None)
         self.params = {}   # (name, path) -> value
         self.geo = {}      # name -> dict(kind=, pos=bytes, tris=bytes|None, n=, ncol=)
@@ -106,6 +107,7 @@ class _State:
         self.record = False
         self.rec_t0 = None
         self.rec = []      # (t, {name: (vals16, camdict)}, {(name,path): value})
+        self.bake_active = False   # bake_recording() drives frame_set itself
         # frame server (Blender -> TD)
         self.fs_sock = None
         self.fs_clients = []
@@ -342,9 +344,14 @@ def _redraw():
                 a.tag_redraw()
 
 
-def _apply():
-    if not S.running:
-        return None
+def _apply_latest():
+    """Drain the latest-value stores and write them into the scene.
+
+    Main thread only. While the timeline is playing (or rendering/scrubbing)
+    this runs from frame_change_pre, in sync with animation evaluation; while
+    paused it runs from the idle timer. Never both at once, so evaluation and
+    the stream can't fight over the same properties (the v0.2 flicker).
+    """
     with S.lock:
         dx = {n: S.xforms[n] for n in S.dirty_x}
         dp = {k: S.params[k] for k in S.dirty_p}
@@ -359,27 +366,66 @@ def _apply():
             S._pps_t = now
 
     changed = bool(dx or dp or dg)
-    try:
-        for name, (vals, camdict) in dx.items():
-            obj = _ensure_object(name, camdict)
-            view = camdict is not None or obj.type in ('CAMERA', 'LIGHT')
-            obj.matrix_world = td_matrix_to_blender(vals, view)
-            _apply_camera_props(obj, camdict)
-        for (name, path), v in dp.items():
-            _set_param(name, path, v)
-        for name in dg:
-            _update_geo(name)
-    except Exception as e:
-        S.last_error = str(e)
+    if changed:
+        try:
+            for name, (vals, camdict) in dx.items():
+                obj = _ensure_object(name, camdict)
+                view = camdict is not None or obj.type in ('CAMERA', 'LIGHT')
+                obj.matrix_world = td_matrix_to_blender(vals, view)
+                _apply_camera_props(obj, camdict)
+            for (name, path), v in dp.items():
+                _set_param(name, path, v)
+            for name in dg:
+                _update_geo(name)
+        except Exception as e:
+            S.last_error = str(e)
 
     if S.record and changed:
         with S.lock:
             t = time.time() - S.rec_t0
             S.rec.append((t, dict(dx), dict(dp)))
+    return changed
 
-    if changed:
+
+@persistent
+def _tdb_frame_pre(scene, depsgraph=None):
+    # Fires once per frame whenever Blender itself advances the timeline:
+    # playback, scrubbing, rendering. bake_recording() calls frame_set in a
+    # loop, so it suspends this to keep the stream out of the bake.
+    if not S.running or S.bake_active:
+        return
+    _apply_latest()
+
+
+def _is_playing():
+    for wm in bpy.data.window_managers:
+        for win in wm.windows:
+            screen = win.screen
+            if screen and screen.is_animation_playing:
+                return True
+    return False
+
+
+def _apply_timer():
+    if not S.running:
+        return None
+    if _is_playing():
+        return 0.1     # frame_change_pre owns the apply; just poll for stop
+    if _apply_latest():
         _redraw()
     return 1.0 / 60.0
+
+
+def _install_frame_handler():
+    _remove_frame_handler()
+    bpy.app.handlers.frame_change_pre.append(_tdb_frame_pre)
+
+
+def _remove_frame_handler():
+    handlers = bpy.app.handlers.frame_change_pre
+    for h in list(handlers):        # match by name: survives script re-runs
+        if getattr(h, "__name__", "") == "_tdb_frame_pre":
+            handlers.remove(h)
 
 
 # -- frame server: EEVEE viewport -> TD -------------------------------------
@@ -556,15 +602,17 @@ def start_bridge(udp_port=9500, tcp_port=9501):
         return False
     S.thread = threading.Thread(target=_reader, daemon=True)
     S.thread.start()
-    bpy.app.timers.register(_apply, first_interval=0.05)
+    _install_frame_handler()
+    bpy.app.timers.register(_apply_timer, first_interval=0.05)
     return True
 
 
 def stop_bridge():
     S.running = False
+    _remove_frame_handler()
     try:
-        if bpy.app.timers.is_registered(_apply):
-            bpy.app.timers.unregister(_apply)
+        if bpy.app.timers.is_registered(_apply_timer):
+            bpy.app.timers.unregister(_apply_timer)
     except Exception:
         pass
     for s in [S.udp, S.tcp] + S.conns:
@@ -604,6 +652,17 @@ def bake_recording(frame_start=1):
     per_frame = {}
     for t, dx, dp in samples:
         per_frame[int(round(t * fps)) + frame_start] = (dx, dp)
+    S.bake_active = True   # frame_set() below fires _tdb_frame_pre
+    try:
+        _bake_frames(per_frame)
+    finally:
+        S.bake_active = False
+    scene.frame_end = max(scene.frame_end, max(per_frame))
+    return len(per_frame)
+
+
+def _bake_frames(per_frame):
+    scene = bpy.context.scene
     for frame in sorted(per_frame):
         dx, dp = per_frame[frame]
         scene.frame_set(frame)
@@ -634,8 +693,6 @@ def bake_recording(frame_start=1):
                 holder.keyframe_insert(attr, frame=frame)
             except Exception:
                 pass
-    scene.frame_end = max(scene.frame_end, max(per_frame))
-    return len(per_frame)
 
 
 # -- UI ----------------------------------------------------------------------
