@@ -29,6 +29,7 @@ import json
 import socket
 import struct
 import math
+import time
 
 # ----------------------------- CONFIG ---------------------------------------
 
@@ -76,9 +77,16 @@ TRANSPOSE_MATRIX = False
 # ----------------------------- internals -------------------------------------
 
 class _Net:
+    # After a failed connect, wait this long before trying again. Without the
+    # backoff a dead Blender stalls TD's whole frame loop: each geometry send
+    # retries connect() and a refused loopback connect burns the full 0.25 s
+    # timeout on Windows (~0.5 s/frame with points + mesh configured).
+    RETRY_S = 2.0
+
     def __init__(self):
         self.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.tcp = None
+        self.next_try = 0.0
 
     def send_json(self, obj):
         try:
@@ -92,11 +100,15 @@ class _Net:
         data = struct.pack('<I', len(payload)) + payload
         for attempt in range(2):
             if self.tcp is None:
+                if time.time() < self.next_try:
+                    return
                 try:
                     self.tcp = socket.create_connection((HOST, TCP_PORT), timeout=0.25)
                     self.tcp.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    self.next_try = 0.0
                 except OSError:
                     self.tcp = None
+                    self.next_try = time.time() + self.RETRY_S
                     return
             try:
                 self.tcp.sendall(data)
