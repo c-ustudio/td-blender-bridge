@@ -82,7 +82,17 @@ Implemented on `phase2-geometry` as protocol v2 (v1 still parses):
 - Deferred: chunked/partial mesh updates — revisit if a real bottleneck
   shows; TCP framing + compression cover current sizes
 
-## Phase 3 — Frames back to TD, properly ← NEXT
+## Phase 3 — Frames back to TD, properly — DONE (2026-08-07)
+
+All items validated live; extras that landed during the phase: TD lights →
+Blender (type/color/dimmer/cone via a "light" dict on xform messages),
+camera-frame cropping for viewport capture (viewport in camera view ⇒ TD
+receives exactly the camera framing, no second render), live params readout
+in the panel, assertive slave-timeline mode, Send-category toggles on the
+component. Depth pass is experimental: material-override view layer renders
+linear depth (edit the TDB_Depth Map Range node to re-range; viewport
+overlays can leak into offscreen renders - disable overlays for clean AOVs).
+
 
 - ~~Validate the TCP RGBA path live~~ done 2026-08-06 (~24-27 fps at
   960x540/30; measured: the double EEVEE render + readback also drags the

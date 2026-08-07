@@ -30,6 +30,8 @@ frame back in TD) **17–39 ms** at 3150×1898 over TCP — Spout at or below th
 - **Camera sync** — Camera COMP world transform, FOV, near/far → Blender
   camera (y-up → z-up and view-axis conversion handled; `lookat` supported)
 - **Object transforms** — any Blender object driven by a COMP's world matrix
+- **Lights** — TD Light COMPs stream as Blender lights: type (point/cone/
+  distant → point/spot/sun), color, dimmer, cone angle/blend, all live
 - **Parameters** — CHOP channels → arbitrary Blender datapaths
   (`data.energy`, `scale`, material node values, …) via a mapping table;
   live values are shown in the Blender panel
@@ -56,8 +58,9 @@ frame back in TD) **17–39 ms** at 3150×1898 over TCP — Spout at or below th
   portable/cross-machine fallback (carries a TD timestamp for latency
   measurement)
 - **Two capture modes** — *Viewport (fast)*: the already-rendered viewport
-  image, no second render, one frame latency; *Scene camera*: offscreen
-  render at an exact resolution
+  image, no second render, one frame latency; with the viewport in camera
+  view (Numpad 0) the frame auto-crops to exactly the camera framing.
+  *Scene camera*: offscreen render at an exact resolution
 - **Depth pass** (experimental, Scene-camera mode) — linear camera-space
   depth via a material-override view layer, delivered as a second Spout
   sender `<name>_depth` / TCP frames → component `out2`
