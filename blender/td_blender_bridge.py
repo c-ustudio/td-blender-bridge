@@ -934,32 +934,53 @@ def _spout_active():
     return getattr(bpy.context.scene, "tdb_fs_transport", 'TCP') == 'SPOUT'
 
 
-def _fs_draw():
-    """View3D draw callback: capture at most once per fs_interval."""
+def _fs_should_capture(mode):
     if not S.fs_running:
-        return
-    spout = _spout_active()
-    if not spout and not S.fs_clients:
-        return
+        return False
+    if getattr(bpy.context.scene, "tdb_fs_mode", 'CAMERA') != mode:
+        return False
+    if not _spout_active() and not S.fs_clients:
+        return False
     now = time.time()
     if now - S.fs_last_cap < S.fs_interval * 0.9:
-        return
+        return False
     S.fs_last_cap = now
-    try:
-        if getattr(bpy.context.scene, "tdb_fs_mode", 'CAMERA') == 'VIEWPORT':
-            result = _fs_grab_viewport()
-        else:
-            result = _fs_capture()
-    except Exception as e:
-        S.fs_error = "capture: %s" % e
-        return
+    return True
+
+
+def _fs_dispatch(result):
     if result is None:
         return
-    if spout:
+    if _spout_active():
         _spout_send(*result)          # GL context is current here
     else:
         S.fs_latest = result          # (pixels, w, h) -> TCP timer
         S.fs_seq += 1
+
+
+def _fs_draw_pre():
+    """PRE_VIEW callback: the region framebuffer still holds the PREVIOUS
+    frame's fully composited viewport image (render + color management).
+    POST_VIEW/POST_PIXEL only see the empty overlay buffer in Blender 5.x,
+    so this is the one stage where a viewport grab reads real pixels -
+    at the cost of one frame of latency."""
+    if not _fs_should_capture('VIEWPORT'):
+        return
+    try:
+        _fs_dispatch(_fs_grab_viewport())
+    except Exception as e:
+        S.fs_error = "capture: %s" % e
+
+
+def _fs_draw_post():
+    """POST_PIXEL callback: offscreen scene-camera render (exact size,
+    second EEVEE pass)."""
+    if not _fs_should_capture('CAMERA'):
+        return
+    try:
+        _fs_dispatch(_fs_capture())
+    except Exception as e:
+        S.fs_error = "capture: %s" % e
 
 
 def _fs_tick():
@@ -1045,8 +1066,12 @@ def start_frame_server(port=9502, width=960, height=540, fps=30):
     S.fs_latest = None
     S.fs_seq = S.fs_sent_seq = 0
     S.fs_last_cap = 0.0
-    S.fs_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
-        _fs_draw, (), 'WINDOW', 'POST_PIXEL')
+    S.fs_draw_handle = (
+        bpy.types.SpaceView3D.draw_handler_add(
+            _fs_draw_pre, (), 'WINDOW', 'PRE_VIEW'),
+        bpy.types.SpaceView3D.draw_handler_add(
+            _fs_draw_post, (), 'WINDOW', 'POST_PIXEL'),
+    )
     bpy.app.timers.register(_fs_tick, first_interval=0.1)
     return True
 
@@ -1054,10 +1079,14 @@ def start_frame_server(port=9502, width=960, height=540, fps=30):
 def stop_frame_server():
     S.fs_running = False
     if S.fs_draw_handle is not None:
-        try:
-            bpy.types.SpaceView3D.draw_handler_remove(S.fs_draw_handle, 'WINDOW')
-        except Exception:
-            pass
+        handles = S.fs_draw_handle
+        if not isinstance(handles, tuple):
+            handles = (handles,)
+        for h in handles:
+            try:
+                bpy.types.SpaceView3D.draw_handler_remove(h, 'WINDOW')
+            except Exception:
+                pass
         S.fs_draw_handle = None
     try:
         if bpy.app.timers.is_registered(_fs_tick):
