@@ -3,135 +3,147 @@
 **Use Blender EEVEE as a realtime render engine for TouchDesigner** — the way
 you'd use Unreal, but with Blender.
 
-TouchDesigner streams cameras, transforms, parameters, point clouds and
-deforming meshes into a live Blender scene; EEVEE renders it; frames stream
-back into a TouchDesigner Script TOP. Everything runs over plain sockets —
-no plugins to compile, just Python on both ends.
+TouchDesigner streams cameras, transforms, CHOP parameters, point clouds,
+instance transforms, deforming meshes and textures into a live Blender scene;
+EEVEE renders it; frames stream back into TD over **Spout** (zero TCP,
+GPU-shared) or TCP. Plain Python on both ends — no plugins to compile.
 
 ```
-┌──────────────────┐   UDP 9500  xforms/cams/params (JSON)    ┌─────────────────┐
-│   TouchDesigner  │ ───────────────────────────────────────► │     Blender     │
-│                  │   TCP 9501  points/meshes (binary)       │   (EEVEE live)  │
-│  td_blender_     │ ───────────────────────────────────────► │                 │
-│  sender.py       │                                          │  td_blender_    │
-│                  │   TCP 9502  RGBA frames back             │  bridge.py      │
-│  blender_        │ ◄─────────────────────────────────────── │  (add-on)       │
-│  receiver.py     │                                          │                 │
-└──────────────────┘                                          └─────────────────┘
+┌──────────────────┐  UDP 9500  xforms/cams/params + TD clock   ┌─────────────────┐
+│   TouchDesigner  │ ─────────────────────────────────────────► │     Blender     │
+│                  │  TCP 9501  points/instances/meshes/        │   (EEVEE live)  │
+│  TDBridge.tox    │            textures (binary, v2)           │                 │
+│  (component)     │ ─────────────────────────────────────────► │  td_blender_    │
+│                  │  Spout "TDBridge" (+ TCP 9502 fallback)    │  bridge.py      │
+│  out1 = frames   │ ◄───────────────────────────────────────── │  (add-on)       │
+│  out2 = depth    │                                            │                 │
+└──────────────────┘                                            └─────────────────┘
 ```
+
+Measured on Windows / RTX 4090 / Blender 5.2 / TD 2025.3x: TD holds 60 fps
+with the full loop running; end-to-end latency (TD transform → EEVEE render →
+frame back in TD) **17–39 ms** at 3150×1898 over TCP — Spout at or below that.
 
 ## Features
 
-- **Camera sync** — TD Camera COMP world transform, FOV, near/far → Blender
-  camera, with correct y-up → z-up and view-axis conversion (lookat supported)
-- **Object transforms** — drive any Blender object from a TD COMP's world matrix
+**TD → Blender**
+- **Camera sync** — Camera COMP world transform, FOV, near/far → Blender
+  camera (y-up → z-up and view-axis conversion handled; `lookat` supported)
+- **Object transforms** — any Blender object driven by a COMP's world matrix
 - **Parameters** — CHOP channels → arbitrary Blender datapaths
-  (`data.energy`, `scale`, material node values, …)
-- **Point clouds** — ~100k points @ 60 fps via `SOP to CHOP` + `numpyArray()`,
-  optional per-point RGBA into a `td_color` attribute
-- **Meshes** — triangulated SOPs with topology caching; deform-only updates are
-  a fast `foreach_set` path
-- **Frames back** — EEVEE viewport rendered offscreen through the scene camera,
-  pushed as RGBA8 over TCP into a Script TOP (default 960×540 @ 30 fps)
-- **Record & bake** — capture a live TD performance, bake camera/params to
-  keyframes, then render the sequence offline in EEVEE (or Cycles)
+  (`data.energy`, `scale`, material node values, …) via a mapping table;
+  live values are shown in the Blender panel
+- **Point clouds** — positions + per-point color/velocity/scale/rotation
+  attributes; auto Geometry Nodes setup renders them as shaded spheres
+  (skipped above 250k points)
+- **Instances** — N transforms → GN instances of any object you pick
+- **Meshes** — triangulated SOPs with topology caching, optional normals/UVs;
+  deform-only updates take a fast `foreach_set` path
+- **POPs** — wire any POP chain through a `POP to CHOP`; the sender
+  understands POP channel names (`P_0/P_1/P_2`, `Color_0..3`, `N_0..`,
+  `pscale`, …) natively
+- **Textures** — any TOP → a Blender image datablock (use it in any
+  Image Texture node)
+- **TD master clock** — every message carries TD's timeline frame + time;
+  optional **Slave timeline to TD** locks Blender's playhead to TD
+  (frame-accurate recording, deterministic playback)
+- **Record & bake** — capture a live performance, bake camera/params to
+  keyframes on the TD clock, render offline in EEVEE or Cycles
+
+**Blender → TD**
+- **Spout transport** (default) — frames shared as a GPU texture into the
+  component's Spout In TOP; no TCP, no TD-side upload. TCP remains as the
+  portable/cross-machine fallback (carries a TD timestamp for latency
+  measurement)
+- **Two capture modes** — *Viewport (fast)*: the already-rendered viewport
+  image, no second render, one frame latency; *Scene camera*: offscreen
+  render at an exact resolution
+- **Depth pass** (experimental, Scene-camera mode) — linear camera-space
+  depth via a material-override view layer, delivered as a second Spout
+  sender `<name>_depth` / TCP frames → component `out2`
 
 ## Quick start
 
 ### Blender
 
-1. `Edit > Preferences > Add-ons > Install from Disk…` → `blender/td_blender_bridge.py`
-2. 3D viewport → press **N** → **TD Bridge** tab → **Start Bridge**
-3. Optional (frames back to TD): **Start Frame Server**
-4. Set viewport shading to **Rendered** — that's your game view
+1. `Edit > Preferences > Add-ons > Install from Disk…` →
+   `blender/td_blender_bridge.py`
+2. 3D viewport → **N** → **TD Bridge** tab → **Start Bridge**
+3. **Start Frame Server** (transport defaults to Spout)
+4. Viewport shading **Rendered**, overlays off — that's your game view
+
+For Spout, install the `SpoutGL` wheel into Blender's user modules once:
+
+```
+"<blender>\python\bin\python.exe" -m pip install --target ^
+  "%APPDATA%\Blender Foundation\Blender\5.2\scripts\modules" SpoutGL
+```
+
+Blender must run the **OpenGL** backend (Preferences → System → GPU Backend)
+for Spout; both apps must be on the same GPU.
 
 ### TouchDesigner
 
-1. Text DAT `td_blender_sender` ← `touchdesigner/td_blender_sender.py`
-2. Text DAT `blender_receiver` ← `touchdesigner/blender_receiver.py` (optional, for frames back)
-3. Script TOP `blender_frame` with callbacks:
+Drop **`touchdesigner/TDBridge.tox`** into your project and fill in the
+Bridge parameter page:
 
-   ```python
-   def onCook(scriptOp):
-       arr = mod('blender_receiver').latest_array()
-       if arr is not None:
-           scriptOp.copyNumpyArray(arr)
-       return
-   ```
+| Parameter | What it does |
+|---|---|
+| Host / ports | Where Blender listens (defaults match the add-on) |
+| Active | Master on/off for all streaming |
+| Camera COMP | Streams as the Blender camera (name par beside it) |
+| Points / Instances CHOP | `SOP to CHOP` or `POP to CHOP` with `tx ty tz` or `P_0 P_1 P_2` (+ color/velocity/scale/rotation channels) |
+| Mesh SOP (+ positions CHOP) | Triangulated SOP; the CHOP is the fast deform path |
+| Texture TOP | Streamed into a Blender image datablock |
+| Params CHOP + `param_map` table | Each row: `channel │ object │ datapath` |
+| Send Camera / Geometry / Textures / Params | Per-category kill switches |
+| Receive Frames, Frame Source | Blender frames via `spout` or `tcp` → `out1` (color), `out2` (depth) |
 
-4. Execute DAT (*Frame Start* on):
+The loose-script setup (Text DATs + Execute DAT) still works — see
+`touchdesigner/td_blender_sender.py` / `blender_receiver.py` headers.
 
-   ```python
-   def onFrameStart(frame):
-       mod('td_blender_sender').tick()
-       mod('blender_receiver').start()
-       op('blender_frame').cook(force=True)
-       return
-   ```
-
-5. Edit the CONFIG block at the top of `td_blender_sender`:
-
-   ```python
-   CAMERAS    = {'/project1/cam1': 'TD_Cam'}
-   XFORM_OBJS = {'/project1/geo1': 'Cube'}
-   PARAM_CHOP = '/project1/params'
-   PARAM_MAP  = {'energy': ('Light', 'data.energy')}
-   POINT_OPS  = {'/project1/sopto1': 'TD_Points'}
-   MESH_SOPS  = {'/project1/geo1/convert1': 'TD_Mesh'}
-   MESH_POS_CHOPS = {'/project1/geo1/convert1': '/project1/sopto1'}
-   ```
-
-Objects are auto-created in Blender when an unknown name arrives (cameras for
-camera messages, empties for transforms, meshes for geometry). If the object
-already exists, the stream drives it — that's the intended workflow: **build
-the look in Blender, perform it from TD.**
+Objects auto-create in Blender when an unknown name arrives; if the object
+exists, the stream drives it. **Build the look in Blender, perform it from
+TD.** While live, baked actions on streamed objects are parked automatically
+and restored on Stop Bridge.
 
 ## Performance recipes
 
-- **Points**: reference a `SOP to CHOP` (channels `tx ty tz`, optional
-  `cr cg cb ca`) in `POINT_OPS`, not the SOP itself — `numpyArray()` is
-  orders of magnitude faster than Python point loops.
-- **Meshes**: grids/spheres output a single `Mesh` prim that can't be
-  indexed — put a **Convert SOP** (to Polygons) in front. Topology re-sends
-  only when point/prim counts change; per-frame deformation goes through the
-  CHOP listed in `MESH_POS_CHOPS`.
-- **Point cloud rendering**: add a Geometry Nodes modifier
-  (`Mesh to Points → Set Material`) to the points object; the streamed colors
-  are in the `td_color` point attribute.
-- **Frames back**: 960×540 @ 30 fps is comfortable on localhost. For
-  production-grade zero-copy sharing on Windows, a Spout add-on for Blender +
-  Spout In TOP is the upgrade path; the built-in TCP stream needs no installs.
-- Debug a silent sender with `mod('td_blender_sender').LAST_ERROR[0]`.
-
-## Record & bake (final quality)
-
-1. TD Bridge panel → **Start Recording**, perform in TD, **Stop Recording**
-2. **Bake Recording to Keyframes** — camera transform + lens, object
-   transforms and params become keyframes at the scene frame rate
-3. Render the sequence properly in EEVEE — or switch the scene to Cycles
-
-Geometry streams aren't recorded (data volume); export Alembic from TD for
-final geometry passes.
+- **Points/meshes**: always reference a `SOP to CHOP` / `POP to CHOP`, not
+  the SOP — `numpyArray()` is orders of magnitude faster. Grid-style SOPs
+  need a **Convert SOP** (to Polygons) before the topology read.
+- **Viewport cost**: the returned frame is whatever the viewport renders —
+  subsurf viewport levels and EEVEE samples are your frame-rate knobs.
+  Keep one 3D viewport visible; capture rides its draw loop.
+- **Frames**: Spout + Viewport capture adds almost nothing on top of the
+  viewport render. The TCP transport scales with resolution (readback +
+  socket + upload); shrink the viewport or use Scene-camera mode at a fixed
+  size if you need cheap frames cross-machine.
+- **Geometry size**: bodies over 512 KB are zlib-compressed automatically;
+  `tools/stress_test.py` streams a 1M-point cloud for scale testing.
+- Debug a silent sender with `mod('td_blender_sender').LAST_ERROR[0]`;
+  the Blender panel shows the last apply/capture error.
 
 ## Coordinates & conventions
 
-- TD is y-up / −z-forward; Blender is z-up. Positions map
-  `(x, y, z)td → (x, −z, y)blender`, matrices are converted accordingly —
-  including the subtlety that cameras must keep local −Z as the view axis
-  (plain change-of-basis conjugation silently points cameras at the floor;
-  see `td_matrix_to_blender` in the add-on).
+- TD is y-up / −z-forward; Blender is z-up. Positions and vectors map
+  `(x, y, z)td → (x, −z, y)b`; scale swaps y/z; per-point rotations travel
+  as quaternions and swizzle `(w,x,y,z) → (w,x,−z,y)`. Cameras keep local
+  −Z as the view axis (see `td_matrix_to_blender`).
 - Camera FOV: TD focal/aperture → horizontal FOV → Blender lens with
   horizontal sensor fit.
-- If transforms arrive mirrored/twisted on your TD build, set
-  `TRANSPOSE_MATRIX = True` in the sender (tdu.Matrix ordering).
+- If transforms arrive mirrored on your TD build, set
+  `TRANSPOSE_MATRIX = True` in the sender.
 
-See [docs/protocol.md](docs/protocol.md) for the wire format.
+See [docs/protocol.md](docs/protocol.md) for the wire format (v2) and
+[PLAN.md](PLAN.md) for the roadmap and per-phase status.
 
 ## Requirements
 
-- Blender 4.2+ (tested on 5.2 LTS), any OS
-- TouchDesigner 2023+ (tested on 2025.33070), Python 3.11 with numpy (bundled)
-- Same machine or LAN (set `HOST` in the TD scripts; open ports 9500–9502)
+- Blender 4.2+ (developed/tested on 5.2 LTS); OpenGL backend for Spout
+- TouchDesigner 2023+ (tested 2025.33070); numpy bundled
+- Spout path: Windows, both apps on the same GPU, `SpoutGL` wheel installed
+- TCP path: any OS, same machine or LAN (open ports 9500–9502)
 
 ## License
 
