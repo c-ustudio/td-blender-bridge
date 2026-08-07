@@ -89,7 +89,11 @@ Implemented on `phase2-geometry` as protocol v2 (v1 still parses):
   interactive viewport - users disable the frame server to get 60 fps back)
 - Stop rendering twice: grab the viewport's already-rendered framebuffer
   (overlays off = clean EEVEE) instead of a second offscreen render
-- ~~Spout backend~~ implemented 2026-08-06 (pending live validation):
+- ~~Spout backend~~ implemented 2026-08-06, validated live 2026-08-07
+  (EEVEE frames upright/opaque in TD's Spout In at the configured rate;
+  viewport grab reads the PRE_VIEW composited buffer - POST stages only
+  see the overlay buffer in Blender 5.x - so no second render, one frame
+  latency). Original notes:
   SpoutGL 0.1.1 (cp313 wheel, installed to the user scripts/modules dir -
   no admin) shares frames from the draw callback; TD receives in the
   component's Spout In TOP (Framesource par: tcp/spout). Current path is
