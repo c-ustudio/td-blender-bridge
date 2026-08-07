@@ -923,7 +923,8 @@ def _spout_send(pixels, w, h):
         S.sp_name = name
         S.sp_error = ""
     try:
-        S.sp_sender.sendImage(pixels, w, h, GL_RGBA, False, 0)
+        # framebuffer readback is bottom-up; invert so receivers see it upright
+        S.sp_sender.sendImage(pixels, w, h, GL_RGBA, True, 0)
         S.fs_frames += 1
     except Exception as e:
         S.sp_error = "spout send: %s" % e
