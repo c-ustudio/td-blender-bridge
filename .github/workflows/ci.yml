@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: ["main", "phase*"]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      - run: ruff check blender touchdesigner tools tests
+      - run: python tools/build_extension.py
+
+  blender-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache Blender
+        id: cache-blender
+        uses: actions/cache@v4
+        with:
+          path: blender-4.2.0-linux-x64
+          key: blender-4.2.0-linux-x64
+      - name: Download Blender
+        if: steps.cache-blender.outputs.cache-hit != 'true'
+        run: |
+          wget -q https://download.blender.org/release/Blender4.2/blender-4.2.0-linux-x64.tar.xz
+          tar -xf blender-4.2.0-linux-x64.tar.xz
+      - name: Smoke test (headless bridge round trip)
+        run: |
+          ./blender-4.2.0-linux-x64/blender -b --factory-startup --python tests/smoke.py

@@ -69,11 +69,26 @@ frame back in TD) **17–39 ms** at 3150×1898 over TCP — Spout at or below th
 
 ### Blender
 
-1. `Edit > Preferences > Add-ons > Install from Disk…` →
-   `blender/td_blender_bridge.py`
-2. 3D viewport → **N** → **TD Bridge** tab → **Start Bridge**
-3. **Start Frame Server** (transport defaults to Spout)
-4. Viewport shading **Rendered**, overlays off — that's your game view
+Two install options:
+
+- **Extension (recommended)**: `python tools/build_extension.py`, then
+  `Preferences > Get Extensions > ⌄ > Install from Disk…` →
+  `dist/td_blender_bridge-<ver>.zip`
+- **Legacy add-on**: `Preferences > Add-ons > Install from Disk…` →
+  `blender/td_blender_bridge.py`
+
+Then:
+
+1. 3D viewport → **N** → **TD Bridge** tab → **Start Bridge**
+2. **Start Frame Server** (transport defaults to Spout)
+3. Viewport shading **Rendered**, overlays off, camera view (Numpad 0) —
+   that's your game view
+4. Optional: enable **Start bridge automatically** in the add-on
+   preferences and the bridge (and frame server) come up on their own
+   every session — zero clicks
+
+An example pair lives in `examples/` (`TDBridge_demo.toe` +
+`TDBridge_demo.blend`) — open both, and the loop is running.
 
 For Spout, install the `SpoutGL` wheel into Blender's user modules once:
 

@@ -130,15 +130,24 @@ overlays can leak into offscreen renders - disable overlays for clean AOVs).
   draw_view3d resolves only color into the offscreen. SOURCE still needed:
   custom depth render (gpu shader batch) or the AOV API ← remaining
 
-## Phase 4 — Packaging & DX
+## Phase 4 — Packaging & DX — DONE (2026-08-07)
 
-- Blender: extension-format packaging (blender_manifest.toml), prefs UI,
-  auto-start option
-- ~~TD: single .tox component~~ done early (2026-08-06):
+- ✅ Blender: extension packaging (`blender_manifest.toml` +
+  `tools/build_extension.py` → installable zip), add-on preferences with
+  auto-start (bridge + frame server on session start / file load)
+- ✅ TD: single .tox component (done early 2026-08-06):
   `touchdesigner/TDBridge.tox` - Bridge parameter page (host/ports/sources/
   Active/Receive Frames toggles), param_map table for CHOP-channel ->
   Blender-datapath mapping, out1 TOP carrying returned frames
-- Example .toe + .blend pair; CI (ruff + headless Blender smoke test)
+- ✅ Example pair: `examples/TDBridge_demo.toe` + `TDBridge_demo.blend`
+  (saved live from the validated test rig)
+- ✅ CI: GitHub Actions - ruff + extension build + headless Blender 4.2
+  smoke test (real socket round trip: camera/light/points -> objects,
+  attributes, GN modifier, TD clock asserted)
+
+Backlog (post-phase niceties): true zero-copy Spout sendTexture (needs a GL
+texture handle from Blender - ctypes route), OSC-in listener, multi-light
+component slots, chunked/partial mesh updates on demand.
 
 ## Workflow from here
 

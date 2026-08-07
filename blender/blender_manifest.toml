@@ -1,0 +1,13 @@
+schema_version = "1.0.0"
+
+id = "td_blender_bridge"
+version = "0.4.0"
+name = "TouchDesigner Bridge"
+tagline = "Two-way realtime bridge with TouchDesigner"
+maintainer = "enric + Claude"
+type = "add-on"
+website = "https://github.com/c-ustudio/td-blender-bridge"
+tags = ["Import-Export", "Render"]
+blender_version_min = "4.2.0"
+license = ["SPDX:MIT"]
+platforms = ["windows-x64", "linux-x64", "macos-arm64", "macos-x64"]

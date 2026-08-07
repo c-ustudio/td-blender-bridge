@@ -1,7 +1,7 @@
 bl_info = {
     "name": "TouchDesigner Bridge (TD -> Blender)",
     "author": "enric + Claude",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (4, 2, 0),
     "location": "3D Viewport > Sidebar > TD Bridge",
     "description": "Two-way realtime bridge with TouchDesigner: drive cameras, transforms, params and geometry from TD (UDP/TCP), stream EEVEE frames back to TD, record & bake to keyframes",
@@ -1480,6 +1480,63 @@ class TDB_OT_fs_stop(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class TDB_prefs(bpy.types.AddonPreferences):
+    # works both as a legacy add-on (module name) and inside an extension
+    # package (bl_ext.<repo>.<id>)
+    bl_idname = __package__ if __package__ else __name__
+
+    autostart: bpy.props.BoolProperty(
+        name="Start bridge automatically", default=False,
+        description="Start the bridge when Blender starts / a file loads, "
+                    "using the scene's port settings")
+    autostart_frames: bpy.props.BoolProperty(
+        name="Also start the frame server", default=False,
+        description="Start the frame server too (transport/capture from the "
+                    "scene settings)")
+
+    def draw(self, context):
+        col = self.layout.column()
+        col.prop(self, "autostart")
+        row = col.row()
+        row.enabled = self.autostart
+        row.prop(self, "autostart_frames")
+
+
+def _get_prefs():
+    try:
+        return bpy.context.preferences.addons[TDB_prefs.bl_idname].preferences
+    except (KeyError, AttributeError):
+        return None
+
+
+def _autostart_tick():
+    """Timer armed at register: waits until Blender is fully up, then starts
+    the bridge if the add-on preference asks for it."""
+    prefs = _get_prefs()
+    if prefs is None or not prefs.autostart:
+        return None
+    if S.running:
+        return None
+    scene = getattr(bpy.context, "scene", None)
+    if scene is None or not hasattr(scene, "tdb_udp_port"):
+        return 0.5     # not ready yet
+    start_bridge(scene.tdb_udp_port, scene.tdb_tcp_port)
+    if prefs.autostart_frames and not S.fs_running:
+        start_frame_server(scene.tdb_fs_port, scene.tdb_fs_width,
+                           scene.tdb_fs_height, scene.tdb_fs_fps)
+    return None
+
+
+@persistent
+def _tdb_load_post(_dummy=None):
+    # a freshly loaded file gets its own scene props; re-arm autostart
+    if not S.running:
+        try:
+            bpy.app.timers.register(_autostart_tick, first_interval=1.0)
+        except Exception:
+            pass
+
+
 class TDB_PT_panel(bpy.types.Panel):
     bl_label = "TD Bridge"
     bl_space_type = 'VIEW_3D'
@@ -1554,7 +1611,7 @@ class TDB_PT_panel(bpy.types.Panel):
             box.label(text=S.sp_error[:64], icon='ERROR')
 
 
-_classes = (TDB_OT_start, TDB_OT_stop, TDB_OT_record, TDB_OT_bake,
+_classes = (TDB_prefs, TDB_OT_start, TDB_OT_stop, TDB_OT_record, TDB_OT_bake,
             TDB_OT_fs_start, TDB_OT_fs_stop, TDB_PT_panel)
 
 
@@ -1630,10 +1687,21 @@ def register():
         stop_frame_server()
     bpy.app.driver_namespace["tdb_stop"] = _stop_all
 
+    if _tdb_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_tdb_load_post)
+    try:
+        bpy.app.timers.register(_autostart_tick, first_interval=1.0)
+    except Exception:
+        pass
+
 
 def unregister():
     stop_bridge()
     stop_frame_server()
+    try:
+        bpy.app.handlers.load_post.remove(_tdb_load_post)
+    except ValueError:
+        pass
     for c in reversed(_classes):
         try:
             bpy.utils.unregister_class(c)

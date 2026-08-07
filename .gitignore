@@ -3,3 +3,8 @@ __pycache__/
 *.blend1
 Backup/
 .DS_Store
+
+dist/
+touchdesigner/TdBridgeTest*
+touchdesigner/Backup/
+*.blend1

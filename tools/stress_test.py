@@ -10,10 +10,8 @@ printed here is the network-side ceiling, the viewport rate is Blender's
 apply-side reality.
 """
 import argparse
-import math
 import socket
 import struct
-import sys
 import time
 import zlib
 
