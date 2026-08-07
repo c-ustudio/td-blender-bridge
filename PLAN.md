@@ -101,7 +101,10 @@ Implemented on `phase2-geometry` as protocol v2 (v1 still parses):
   true zero-copy sendTexture needs a GL texture handle Blender's gpu
   module doesn't expose - revisit via ctypes GL queries. Requires the
   OpenGL backend in Blender; TCP remains the cross-machine fallback
-- Latency budget & measurement (target < 3 frames end-to-end)
+- ~~Latency budget & measurement~~ measured 2026-08-07: TDBF v2 carries a
+  TD timestamp; end-to-end (TD xform -> EEVEE render -> frame back in TD)
+  over TCP at 3150x1898: **min 17 ms / avg 39 ms** = 1-2.4 frames @60 -
+  meets the <3 frame target; Spout should sit at or below this
 - ~~TOP -> Blender textures~~ implemented 2026-08-06 (kind-4 frames,
   `TOP_OPS` / component Textop par -> Blender image datablock; pending
   live validation)
@@ -111,7 +114,11 @@ Implemented on `phase2-geometry` as protocol v2 (v1 still parses):
   names (`P_0/P_1/P_2`, `Color_0..3`, `N_0..`, `v_0..`, `pscale`,
   `UV_0/1`) alongside SOP-to-CHOP names - wire POP -> poptoCHOP ->
   Points/Instances par, no renaming
-- Optional depth/AOV passes for TD-side compositing
+- Depth/AOV passes: transport DONE 2026-08-07 (TCP fmt-3 frames + Spout
+  "<name>_depth" sender + component out2), but Blender 5.2 exposes no real
+  depth to either capture path - the region fb depth is empty and
+  draw_view3d resolves only color into the offscreen. SOURCE still needed:
+  custom depth render (gpu shader batch) or the AOV API ← remaining
 
 ## Phase 4 — Packaging & DX
 
