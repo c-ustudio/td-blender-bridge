@@ -105,7 +105,8 @@ Same length-prefix framing, pushed by Blender at the configured rate:
 ```
 payload := "TDBF" u8 version u8 fmt u16 width u16 height [f64 td_time] pixels
 fmt 1 = RGBA8 color, rows bottom-up (GL order), width*height*4 bytes
-fmt 3 = depth pass as grayscale RGBA8 (near = bright, nonlinear window depth)
+fmt 3 = depth pass as grayscale RGBA8 (near = bright)
+fmt bit 7 set = pixel payload is zlib-compressed (LAN mode)
 ```
 
 Version 2 inserts `td_time` (f64, the TD `absTime.seconds` stamp the frame

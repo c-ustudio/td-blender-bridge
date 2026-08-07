@@ -29,6 +29,7 @@ import socket
 import struct
 import threading
 import time
+import zlib
 
 HOST = '127.0.0.1'
 PORT = 9502
@@ -66,17 +67,27 @@ def _reader():
                     del buf[:4 + plen]
                     if payload[:4] == b'TDBF':
                         ver, fmt = payload[4], payload[5]
+                        comp = bool(fmt & 0x80)   # zlib'd pixels (LAN mode)
+                        fmt &= 0x7F
                         w, h = struct.unpack_from('<HH', payload, 6)
                         off = 10
                         if ver >= 2:
                             (STATE['tm'],) = struct.unpack_from('<d', payload, 10)
                             off = 18
-                        if fmt == 1:      # RGBA8 color
-                            STATE['latest'] = payload[off:]
+                        data = payload[off:]
+                        if comp:
+                            try:
+                                data = zlib.decompress(data)
+                            except zlib.error:
+                                data = None
+                        if data is None:
+                            pass
+                        elif fmt == 1:    # RGBA8 color
+                            STATE['latest'] = data
                             STATE['w'], STATE['h'] = w, h
                             STATE['frames'] += 1
                         elif fmt == 3:    # grayscale depth (RGBA8)
-                            STATE['depth'] = payload[off:]
+                            STATE['depth'] = data
                             STATE['dw'], STATE['dh'] = w, h
         except OSError:
             pass

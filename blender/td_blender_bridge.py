@@ -1176,13 +1176,24 @@ def _fs_tick():
         return S.fs_interval / 2
     S.fs_sent_seq = S.fs_seq
     pixels, w, h, tm, depth = S.fs_latest
+    # LAN mode: zlib the pixel payloads (fmt bit 7) - raw 1080p30 is ~2 Gb/s,
+    # compressed rendered content typically fits gigabit
+    compress = getattr(bpy.context.scene, "tdb_fs_compress", False)
+    fmt = 1
+    if compress:
+        pixels = zlib.compress(pixels, 1)
+        fmt |= 0x80
     # TDBF v2: f64 TD-timestamp after the size -> receiver computes latency
-    header = (b"TDBF" + bytes([2, 1]) + struct.pack("<HH", w, h)
+    header = (b"TDBF" + bytes([2, fmt]) + struct.pack("<HH", w, h)
               + struct.pack("<d", tm))
     payload = header + pixels
     packet = struct.pack("<I", len(payload)) + payload
     if depth is not None:
-        dhead = (b"TDBF" + bytes([2, 3]) + struct.pack("<HH", w, h)
+        dfmt = 3
+        if compress:
+            depth = zlib.compress(depth, 1)
+            dfmt |= 0x80
+        dhead = (b"TDBF" + bytes([2, dfmt]) + struct.pack("<HH", w, h)
                  + struct.pack("<d", tm))
         packet += struct.pack("<I", len(dhead) + len(depth)) + dhead + depth
     S.fs_frames += 1
@@ -1590,6 +1601,7 @@ class TDB_PT_panel(bpy.types.Panel):
             box.prop(context.scene, "tdb_spout_name")
         else:
             box.prop(context.scene, "tdb_fs_port")
+            box.prop(context.scene, "tdb_fs_compress")
         if context.scene.tdb_fs_mode == 'CAMERA':
             row = box.row()
             row.prop(context.scene, "tdb_fs_width")
@@ -1666,6 +1678,11 @@ def register():
                 "Render the scene camera offscreen at the configured "
                 "resolution - exact size and framing, but pays for a full "
                 "second EEVEE render per frame")))
+    bpy.types.Scene.tdb_fs_compress = bpy.props.BoolProperty(
+        name="Compress frames (LAN)", default=False,
+        description="zlib the TCP frame stream - use when Blender runs on "
+                    "another machine over gigabit. Costs CPU per frame; "
+                    "prefer Scene-camera capture at a fixed resolution")
     bpy.types.Scene.tdb_fs_depth = bpy.props.BoolProperty(
         name="Depth pass", default=False,
         description="Also send a grayscale depth pass (near = bright, "
@@ -1709,7 +1726,8 @@ def unregister():
             pass
     for p in ("tdb_udp_port", "tdb_tcp_port", "tdb_live_mute",
               "tdb_slave_timeline", "tdb_smooth", "tdb_fs_transport",
-              "tdb_spout_name", "tdb_fs_mode", "tdb_fs_depth", "tdb_fs_port",
+              "tdb_spout_name", "tdb_fs_mode", "tdb_fs_depth",
+              "tdb_fs_compress", "tdb_fs_port",
               "tdb_fs_width", "tdb_fs_height", "tdb_fs_fps"):
         if hasattr(bpy.types.Scene, p):
             delattr(bpy.types.Scene, p)

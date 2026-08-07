@@ -153,6 +153,15 @@ and restored on Stop Bridge.
 - If transforms arrive mirrored on your TD build, set
   `TRANSPOSE_MATRIX = True` in the sender.
 
+## Multi-machine
+
+TD on the performance machine, Blender on a dedicated render node: set the
+component's **Blender Host** to the node's IP, Frame Source `tcp`,
+Transport TCP in Blender — and for gigabit links enable **Compress frames
+(LAN)**. With auto-start enabled on the node it needs zero clicks after
+boot. Full setup, bandwidth budgets and every parameter:
+[docs/reference.md](docs/reference.md).
+
 See [docs/protocol.md](docs/protocol.md) for the wire format (v2) and
 [PLAN.md](PLAN.md) for the roadmap and per-phase status.
 
