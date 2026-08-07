@@ -872,10 +872,27 @@ def _fs_capture():
         import gpu as _g
         fb = _g.state.active_framebuffer_get()
         buf = fb.read_color(0, 0, w, h, 4, 0, 'UBYTE')
-        depth = (_read_depth_rgba(fb, w, h)
-                 if getattr(bpy.context.scene, "tdb_fs_depth", False) else None)
     buf.dimensions = w * h * 4
-    return _gpu_buf_bytes(buf, w * h * 4), w, h, depth
+    color = _gpu_buf_bytes(buf, w * h * 4)
+    depth = None
+    # NEVER create the layer here: datablock creation inside a draw callback
+    # builds a depsgraph mid-draw and deadlocks Blender. _fs_tick (a timer,
+    # safe context) creates and warms it; we only use it if it exists.
+    if getattr(bpy.context.scene, "tdb_fs_depth", False):
+        vl = scene.view_layers.get("TDB_Depth")
+        if vl is None:
+            return color, w, h, None
+        try:
+            S.fs_offscreen.draw_view3d(scene, vl, space, region, vm, pm,
+                                       do_color_management=False)
+        except TypeError:
+            S.fs_offscreen.draw_view3d(scene, vl, space, region, vm, pm)
+        with S.fs_offscreen.bind():
+            fb = gpu.state.active_framebuffer_get()
+            dbuf = fb.read_color(0, 0, w, h, 4, 0, 'UBYTE')
+        dbuf.dimensions = w * h * 4
+        depth = _gpu_buf_bytes(dbuf, w * h * 4)
+    return color, w, h, depth
 
 
 def _gpu_buf_bytes(buf, nbytes):
@@ -887,22 +904,40 @@ def _gpu_buf_bytes(buf, nbytes):
         return _np.array(buf.to_list(), dtype=_np.uint8).tobytes()
 
 
-def _read_depth_rgba(fb, w, h):
-    """Depth buffer -> grayscale RGBA8 (near = bright). Window-space depth,
-    nonlinear - linearize TD-side if you need metric depth."""
-    dbuf = fb.read_depth(0, 0, w, h)
-    dbuf.dimensions = w * h
-    try:
-        d = np.frombuffer(memoryview(dbuf), dtype=np.float32).copy()
-    except TypeError:
-        d = np.array(dbuf.to_list(), dtype=np.float32)
-    d8 = (np.clip(1.0 - d, 0.0, 1.0) * 255.0).astype(np.uint8)
-    rgba = np.empty(w * h * 4, np.uint8)
-    rgba[0::4] = d8
-    rgba[1::4] = d8
-    rgba[2::4] = d8
-    rgba[3::4] = 255
-    return rgba.tobytes()
+def _ensure_depth_layer(scene, cam):
+    """View layer 'TDB_Depth' whose material override emits linear
+    camera-space depth (near = bright, mapped over the camera clip range).
+    EEVEE renders it like any color image - no framebuffer depth needed.
+    Edit the TDB_Depth material's Map Range node to change the mapping."""
+    mat = bpy.data.materials.get("TDB_Depth")
+    if mat is None:
+        mat = bpy.data.materials.new("TDB_Depth")
+        mat.use_nodes = True
+        nt = mat.node_tree
+        nt.nodes.clear()
+        out = nt.nodes.new('ShaderNodeOutputMaterial')
+        out.location = (400, 0)
+        em = nt.nodes.new('ShaderNodeEmission')
+        em.location = (200, 0)
+        camd = nt.nodes.new('ShaderNodeCameraData')
+        camd.location = (-220, 0)
+        mr = nt.nodes.new('ShaderNodeMapRange')
+        mr.location = (0, 0)
+        mr.inputs['From Min'].default_value = (cam.data.clip_start
+                                               if cam else 0.1)
+        mr.inputs['From Max'].default_value = (cam.data.clip_end
+                                               if cam else 100.0)
+        mr.inputs['To Min'].default_value = 1.0     # near = bright
+        mr.inputs['To Max'].default_value = 0.0
+        nt.links.new(camd.outputs['View Z Depth'], mr.inputs['Value'])
+        nt.links.new(mr.outputs['Result'], em.inputs['Color'])
+        nt.links.new(em.outputs['Emission'], out.inputs['Surface'])
+    vl = scene.view_layers.get("TDB_Depth")
+    if vl is None:
+        vl = scene.view_layers.new("TDB_Depth")
+    if vl.material_override is not mat:
+        vl.material_override = mat
+    return vl
 
 
 def _fs_grab_viewport():
@@ -924,9 +959,9 @@ def _fs_grab_viewport():
     data = np.frombuffer(bytearray(_gpu_buf_bytes(buf, w * h * 4)),
                          dtype=np.uint8)
     data[3::4] = 255   # viewport alpha is overlay junk -> receivers see a ghost
-    depth = (_read_depth_rgba(fb, w, h)
-             if getattr(bpy.context.scene, "tdb_fs_depth", False) else None)
-    return data.tobytes(), w, h, depth
+    # no depth here: the region framebuffer carries no scene depth - the
+    # depth pass needs the Scene-camera capture mode (override-layer render)
+    return data.tobytes(), w, h, None
 
 
 GL_RGBA = 0x1908
@@ -1039,6 +1074,16 @@ def _fs_tick():
     even when the viewport is otherwise idle."""
     if not S.fs_running:
         return None
+    # depth-layer creation must happen HERE (timer = safe main-thread
+    # context), never in the draw callback
+    scene = bpy.context.scene
+    if (getattr(scene, "tdb_fs_depth", False)
+            and scene.view_layers.get("TDB_Depth") is None):
+        try:
+            vl = _ensure_depth_layer(scene, scene.camera)
+            vl.update()          # warm the depsgraph outside any draw
+        except Exception as e:
+            S.fs_error = "depth setup: %s" % e
     # accept new clients (non-blocking)
     while S.fs_sock is not None:
         try:
