@@ -893,7 +893,10 @@ def _fs_grab_viewport():
         return None
     fb = gpu.state.active_framebuffer_get()
     buf = fb.read_color(0, 0, w, h, 4, 0, 'UBYTE')
-    return _gpu_buf_bytes(buf, w * h * 4), w, h
+    data = np.frombuffer(bytearray(_gpu_buf_bytes(buf, w * h * 4)),
+                         dtype=np.uint8)
+    data[3::4] = 255   # viewport alpha is overlay junk -> receivers see a ghost
+    return data.tobytes(), w, h
 
 
 GL_RGBA = 0x1908
