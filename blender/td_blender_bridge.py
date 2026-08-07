@@ -141,6 +141,7 @@ class _State:
         self.sp_sender = None
         self.sp_name = ""
         self.sp_error = ""
+        self.sp_depth_sender = None
         self.fs_seq = 0            # bumped per capture
         self.fs_sent_seq = 0
 
@@ -789,13 +790,20 @@ def _is_playing():
 def _apply_timer():
     if not S.running:
         return None
-    if _is_playing():
-        return 0.1     # frame_change_pre owns the apply; just poll for stop
     scene = bpy.context.scene
-    if getattr(scene, "tdb_slave_timeline", False) and S.td_frame is not None:
-        # TD is the master clock: follow its timeline frame. frame_set fires
-        # _tdb_frame_pre, which applies the stream in sync with evaluation.
-        # (Leave Blender's own playback stopped while slaved.)
+    slave = getattr(scene, "tdb_slave_timeline", False) and S.td_frame is not None
+    if _is_playing():
+        if slave:
+            # TD is the master clock - Blender's own player would fight it
+            try:
+                bpy.ops.screen.animation_cancel(restore_frame=False)
+            except Exception:
+                return 0.1
+        else:
+            return 0.1     # frame_change_pre owns the apply; poll for stop
+    if slave:
+        # follow TD's timeline frame. frame_set fires _tdb_frame_pre, which
+        # applies the stream in sync with evaluation.
         f = int(round(S.td_frame))
         if f != scene.frame_current:
             scene.frame_set(f)
@@ -864,8 +872,10 @@ def _fs_capture():
         import gpu as _g
         fb = _g.state.active_framebuffer_get()
         buf = fb.read_color(0, 0, w, h, 4, 0, 'UBYTE')
+        depth = (_read_depth_rgba(fb, w, h)
+                 if getattr(bpy.context.scene, "tdb_fs_depth", False) else None)
     buf.dimensions = w * h * 4
-    return _gpu_buf_bytes(buf, w * h * 4), w, h
+    return _gpu_buf_bytes(buf, w * h * 4), w, h, depth
 
 
 def _gpu_buf_bytes(buf, nbytes):
@@ -875,6 +885,24 @@ def _gpu_buf_bytes(buf, nbytes):
     except TypeError:
         import numpy as _np
         return _np.array(buf.to_list(), dtype=_np.uint8).tobytes()
+
+
+def _read_depth_rgba(fb, w, h):
+    """Depth buffer -> grayscale RGBA8 (near = bright). Window-space depth,
+    nonlinear - linearize TD-side if you need metric depth."""
+    dbuf = fb.read_depth(0, 0, w, h)
+    dbuf.dimensions = w * h
+    try:
+        d = np.frombuffer(memoryview(dbuf), dtype=np.float32).copy()
+    except TypeError:
+        d = np.array(dbuf.to_list(), dtype=np.float32)
+    d8 = (np.clip(1.0 - d, 0.0, 1.0) * 255.0).astype(np.uint8)
+    rgba = np.empty(w * h * 4, np.uint8)
+    rgba[0::4] = d8
+    rgba[1::4] = d8
+    rgba[2::4] = d8
+    rgba[3::4] = 255
+    return rgba.tobytes()
 
 
 def _fs_grab_viewport():
@@ -896,7 +924,9 @@ def _fs_grab_viewport():
     data = np.frombuffer(bytearray(_gpu_buf_bytes(buf, w * h * 4)),
                          dtype=np.uint8)
     data[3::4] = 255   # viewport alpha is overlay junk -> receivers see a ghost
-    return data.tobytes(), w, h
+    depth = (_read_depth_rgba(fb, w, h)
+             if getattr(bpy.context.scene, "tdb_fs_depth", False) else None)
+    return data.tobytes(), w, h, depth
 
 
 GL_RGBA = 0x1908
@@ -930,6 +960,23 @@ def _spout_send(pixels, w, h):
         S.sp_error = "spout send: %s" % e
 
 
+def _spout_send_depth(pixels, w, h):
+    """Second Spout sender '<name>_depth' carrying the grayscale depth pass."""
+    try:
+        import SpoutGL
+    except ImportError:
+        return
+    name = (getattr(bpy.context.scene, "tdb_spout_name", "TDBridge")
+            or "TDBridge") + "_depth"
+    if S.sp_depth_sender is None:
+        S.sp_depth_sender = SpoutGL.SpoutSender()
+        S.sp_depth_sender.setSenderName(name)
+    try:
+        S.sp_depth_sender.sendImage(pixels, w, h, GL_RGBA, True, 0)
+    except Exception as e:
+        S.sp_error = "spout depth: %s" % e
+
+
 def _spout_active():
     return getattr(bpy.context.scene, "tdb_fs_transport", 'TCP') == 'SPOUT'
 
@@ -951,10 +998,14 @@ def _fs_should_capture(mode):
 def _fs_dispatch(result):
     if result is None:
         return
+    pixels, w, h, depth = result
     if _spout_active():
-        _spout_send(*result)          # GL context is current here
+        _spout_send(pixels, w, h)     # GL context is current here
+        if depth is not None:
+            _spout_send_depth(depth, w, h)
     else:
-        S.fs_latest = result          # (pixels, w, h) -> TCP timer
+        tm = S.td_time if S.td_time is not None else 0.0
+        S.fs_latest = (pixels, w, h, tm, depth)
         S.fs_seq += 1
 
 
@@ -1007,10 +1058,16 @@ def _fs_tick():
     if S.fs_latest is None or S.fs_seq == S.fs_sent_seq:
         return S.fs_interval / 2
     S.fs_sent_seq = S.fs_seq
-    pixels, w, h = S.fs_latest
-    header = b"TDBF" + bytes([1, 1]) + struct.pack("<HH", w, h)
+    pixels, w, h, tm, depth = S.fs_latest
+    # TDBF v2: f64 TD-timestamp after the size -> receiver computes latency
+    header = (b"TDBF" + bytes([2, 1]) + struct.pack("<HH", w, h)
+              + struct.pack("<d", tm))
     payload = header + pixels
     packet = struct.pack("<I", len(payload)) + payload
+    if depth is not None:
+        dhead = (b"TDBF" + bytes([2, 3]) + struct.pack("<HH", w, h)
+                 + struct.pack("<d", tm))
+        packet += struct.pack("<I", len(dhead) + len(depth)) + dhead + depth
     S.fs_frames += 1
     for c in list(S.fs_clients):
         pending = S.fs_pending.get(c)
@@ -1103,13 +1160,15 @@ def stop_frame_server():
     S.fs_sock = None
     S.fs_offscreen = None
     S.fs_latest = None
-    if S.sp_sender is not None:
-        try:
-            S.sp_sender.releaseSender()
-        except Exception:
-            pass
-        S.sp_sender = None
-        S.sp_name = ""
+    for attr in ("sp_sender", "sp_depth_sender"):
+        snd = getattr(S, attr)
+        if snd is not None:
+            try:
+                snd.releaseSender()
+            except Exception:
+                pass
+            setattr(S, attr, None)
+    S.sp_name = ""
 
 
 # -- lifecycle ---------------------------------------------------------------
@@ -1323,6 +1382,15 @@ class TDB_PT_panel(bpy.types.Panel):
                           icon='ACTION')
             if S.td_frame is not None:
                 col.label(text=f"TD frame {S.td_frame:.0f}", icon='TIME')
+            if S.params:
+                col.label(text=f"{len(S.params)} param(s) streaming:",
+                          icon='DRIVER')
+                for (n, p), v in list(S.params.items())[:4]:
+                    try:
+                        vs = f"{v:.3f}" if isinstance(v, float) else str(v)
+                    except Exception:
+                        vs = "?"
+                    col.label(text=f"  {n}.{p} = {vs}")
         else:
             col.operator("tdb.start", icon='PLAY')
             col.label(text="stopped")
@@ -1350,6 +1418,7 @@ class TDB_PT_panel(bpy.types.Panel):
             row.prop(context.scene, "tdb_fs_width")
             row.prop(context.scene, "tdb_fs_height")
         box.prop(context.scene, "tdb_fs_fps")
+        box.prop(context.scene, "tdb_fs_depth")
         if S.fs_running:
             box.operator("tdb.fs_stop", icon='PAUSE')
             if context.scene.tdb_fs_transport == 'SPOUT':
@@ -1420,6 +1489,11 @@ def register():
                 "Render the scene camera offscreen at the configured "
                 "resolution - exact size and framing, but pays for a full "
                 "second EEVEE render per frame")))
+    bpy.types.Scene.tdb_fs_depth = bpy.props.BoolProperty(
+        name="Depth pass", default=False,
+        description="Also send a grayscale depth pass (near = bright, "
+                    "nonlinear window depth). Spout: second sender "
+                    "'<name>_depth'; TCP: fmt-3 frames")
     bpy.types.Scene.tdb_fs_port = bpy.props.IntProperty(
         name="Frame port", default=9502, min=1024, max=65535)
     bpy.types.Scene.tdb_fs_width = bpy.props.IntProperty(
@@ -1447,7 +1521,7 @@ def unregister():
             pass
     for p in ("tdb_udp_port", "tdb_tcp_port", "tdb_live_mute",
               "tdb_slave_timeline", "tdb_smooth", "tdb_fs_transport",
-              "tdb_spout_name", "tdb_fs_mode", "tdb_fs_port",
+              "tdb_spout_name", "tdb_fs_mode", "tdb_fs_depth", "tdb_fs_port",
               "tdb_fs_width", "tdb_fs_height", "tdb_fs_fps"):
         if hasattr(bpy.types.Scene, p):
             delattr(bpy.types.Scene, p)

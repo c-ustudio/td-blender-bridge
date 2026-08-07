@@ -89,9 +89,16 @@ positions are updated (fast path).
 Same length-prefix framing, pushed by Blender at the configured rate:
 
 ```
-payload := "TDBF" u8 version u8 fmt u16 width u16 height pixels
-fmt 1 = RGBA8, rows bottom-up (GL order), width*height*4 bytes
+payload := "TDBF" u8 version u8 fmt u16 width u16 height [f64 td_time] pixels
+fmt 1 = RGBA8 color, rows bottom-up (GL order), width*height*4 bytes
+fmt 3 = depth pass as grayscale RGBA8 (near = bright, nonlinear window depth)
 ```
+
+Version 2 inserts `td_time` (f64, the TD `absTime.seconds` stamp the frame
+was generated under) after the size — the receiver computes end-to-end
+latency as `absTime.seconds - td_time` in a single clock domain. Version 1
+frames (no timestamp) still parse. Over Spout, the depth pass appears as a
+second sender named `<sender>_depth`; no timestamp channel exists there.
 
 Per-client frame dropping: if a client hasn't finished reading the previous
 frame, new frames are skipped for it; clients more than ~32 frames behind are
