@@ -48,6 +48,14 @@ XFORM_OBJS = {
     # 'geo1': 'Cube',
 }
 
+# TD Light COMP -> Blender light (created if missing). Type (point/cone/
+# distant -> POINT/SPOT/SUN), color, dimmer and cone angle stream live;
+# dimmer maps to watts heuristically (x1000, x3 for sun) - drive
+# data.energy via PARAM_MAP for exact control.
+LIGHTS = {
+    # 'light1': 'TD_Light',
+}
+
 # CHOP -> per-channel mapping to Blender object datapaths
 # channel name -> (blender object, datapath)
 PARAM_CHOP = None         # e.g. 'params'
@@ -206,6 +214,21 @@ def send_xform(td_path, bl_name):
     if comp is None:
         return
     _net.send_json({'t': 'xform', 'n': bl_name, 'm': _matrix16(comp.worldTransform)})
+
+
+def send_light(td_path, bl_name):
+    lt = op(td_path)
+    if lt is None:
+        return
+    d = {'type': lt.par.lighttype.eval(),
+         'dimmer': float(lt.par.dimmer),
+         'color': [float(lt.par.wcolorr), float(lt.par.wcolorg),
+                   float(lt.par.wcolorb)]}
+    if d['type'] == 'cone':
+        d['angle'] = float(lt.par.coneangle)
+        d['delta'] = float(lt.par.conedelta)
+    _net.send_json({'t': 'xform', 'n': bl_name,
+                    'm': _matrix16(lt.worldTransform), 'light': d})
 
 
 def send_params():
@@ -439,6 +462,8 @@ def tick():
         _safe(send_camera, td_path, bl_name)
     for td_path, bl_name in XFORM_OBJS.items():
         _safe(send_xform, td_path, bl_name)
+    for td_path, bl_name in LIGHTS.items():
+        _safe(send_light, td_path, bl_name)
     _safe(send_params)
     for td_path, bl_name in POINT_OPS.items():
         _safe(send_points, td_path, bl_name)

@@ -165,7 +165,7 @@ def _handle_udp(data):
         if tm is not None:
             S.td_time = tm
         if t == "xform":
-            S.xforms[msg["n"]] = (msg["m"], msg.get("cam"))
+            S.xforms[msg["n"]] = (msg["m"], msg.get("cam"), msg.get("light"))
             S.dirty_x.add(msg["n"])
         elif t == "param":
             S.params[(msg["n"], msg["p"])] = msg["v"]
@@ -331,17 +331,49 @@ def _reader():
 
 # -- main-thread apply (bpy work) --------------------------------------------
 
-def _ensure_object(name, camdict):
+_TD_LIGHT_TYPES = {"point": 'POINT', "cone": 'SPOT', "distant": 'SUN'}
+
+
+def _ensure_object(name, camdict, lightdict=None):
     obj = bpy.data.objects.get(name)
     if obj is None:
         if camdict is not None:
             data = bpy.data.cameras.new(name)
+            obj = bpy.data.objects.new(name, data)
+        elif lightdict is not None:
+            data = bpy.data.lights.new(
+                name, _TD_LIGHT_TYPES.get(lightdict.get("type"), 'POINT'))
             obj = bpy.data.objects.new(name, data)
         else:
             obj = bpy.data.objects.new(name, None)
             obj.empty_display_size = 0.3
         bpy.context.scene.collection.objects.link(obj)
     return obj
+
+
+def _apply_light_props(obj, lightdict):
+    """TD Light COMP -> Blender light. dimmer maps to watts heuristically
+    (x1000 point/spot, x3 sun); drive data.energy via the param path for
+    exact control."""
+    if obj.type != 'LIGHT' or not lightdict:
+        return
+    lt = obj.data
+    want = _TD_LIGHT_TYPES.get(lightdict.get("type"), lt.type)
+    if lt.type != want:
+        lt.type = want
+    col = lightdict.get("color")
+    if col and len(col) >= 3:
+        lt.color = col[:3]
+    dim = lightdict.get("dimmer")
+    if dim is not None:
+        lt.energy = dim * (3.0 if lt.type == 'SUN' else 1000.0)
+    if lt.type == 'SPOT':
+        ang = lightdict.get("angle")
+        if ang:
+            lt.spot_size = math.radians(max(0.1, min(179.0, ang)))
+            delta = lightdict.get("delta")
+            if delta is not None and ang > 0:
+                lt.spot_blend = max(0.0, min(1.0, delta / ang))
 
 
 def _apply_camera_props(obj, camdict):
@@ -717,14 +749,18 @@ def _apply_latest():
             scene = bpy.context.scene
             live_mute = getattr(scene, "tdb_live_mute", True)
             smooth = getattr(scene, "tdb_smooth", 0.0)
-            for name, (vals, camdict) in dx.items():
-                obj = _ensure_object(name, camdict)
+            for name, entry in dx.items():
+                vals, camdict = entry[0], entry[1]
+                lightdict = entry[2] if len(entry) > 2 else None
+                obj = _ensure_object(name, camdict, lightdict)
                 if live_mute:
                     _mute_actions(obj)
-                view = camdict is not None or obj.type in ('CAMERA', 'LIGHT')
+                view = (camdict is not None or lightdict is not None
+                        or obj.type in ('CAMERA', 'LIGHT'))
                 m = td_matrix_to_blender(vals, view)
                 obj.matrix_world = _smoothed(name, m, smooth)
                 _apply_camera_props(obj, camdict)
+                _apply_light_props(obj, lightdict)
             for (name, path), v in dp.items():
                 _set_param(name, path, v)
             for name in dg:
@@ -940,22 +976,58 @@ def _ensure_depth_layer(scene, cam):
     return vl
 
 
+def _camera_frame_rect(region, space, scene):
+    """If the viewport is locked to the scene camera, return the camera
+    frame's pixel rect (x, y, w, h) so the grab crops to exactly what the
+    camera sees instead of the whole viewport."""
+    r3d = space.region_3d
+    cam = scene.camera
+    if cam is None or r3d.view_perspective != 'CAMERA':
+        return None
+    try:
+        from bpy_extras import view3d_utils
+        corners = [cam.matrix_world @ v
+                   for v in cam.data.view_frame(scene=scene)]
+        pts = [view3d_utils.location_3d_to_region_2d(region, r3d, co)
+               for co in corners]
+    except Exception:
+        return None
+    if any(p is None for p in pts):
+        return None
+    x0 = max(0, int(min(p.x for p in pts)))
+    y0 = max(0, int(min(p.y for p in pts)))
+    x1 = min(region.width, int(max(p.x for p in pts)))
+    y1 = min(region.height, int(max(p.y for p in pts)))
+    w = (x1 - x0) - ((x1 - x0) % 2)
+    h = (y1 - y0) - ((y1 - y0) % 2)
+    if w < 8 or h < 8:
+        return None
+    return x0, y0, w, h
+
+
 def _fs_grab_viewport():
     """Read the viewport's already-rendered framebuffer instead of paying for
     a second offscreen EEVEE render. Runs inside the draw callback, so the
-    active framebuffer IS the viewport being drawn. Frame size follows the
-    viewport; overlays/gizmos are included unless disabled in that viewport."""
+    active framebuffer IS the viewport being drawn. When the viewport is in
+    camera view the grab crops to the camera frame (exact camera framing);
+    otherwise the full viewport is sent. Overlays/gizmos are included unless
+    disabled in that viewport."""
     import gpu
     region = bpy.context.region
     space = getattr(bpy.context, "space_data", None)
     if region is None or space is None or space.type != 'VIEW_3D':
         return None
-    w = region.width - (region.width % 2)
-    h = region.height - (region.height % 2)
+    rect = _camera_frame_rect(region, space, bpy.context.scene)
+    if rect is not None:
+        x0, y0, w, h = rect
+    else:
+        x0, y0 = 0, 0
+        w = region.width - (region.width % 2)
+        h = region.height - (region.height % 2)
     if w < 8 or h < 8:
         return None
     fb = gpu.state.active_framebuffer_get()
-    buf = fb.read_color(0, 0, w, h, 4, 0, 'UBYTE')
+    buf = fb.read_color(x0, y0, w, h, 4, 0, 'UBYTE')
     data = np.frombuffer(bytearray(_gpu_buf_bytes(buf, w * h * 4)),
                          dtype=np.uint8)
     data[3::4] = 255   # viewport alpha is overlay junk -> receivers see a ghost
@@ -1308,9 +1380,12 @@ def _bake_frames(per_frame):
     for frame in sorted(per_frame):
         dx, dp = per_frame[frame]
         scene.frame_set(frame)
-        for name, (vals, camdict) in dx.items():
-            obj = _ensure_object(name, camdict)
-            view = camdict is not None or obj.type in ('CAMERA', 'LIGHT')
+        for name, entry in dx.items():
+            vals, camdict = entry[0], entry[1]
+            lightdict = entry[2] if len(entry) > 2 else None
+            obj = _ensure_object(name, camdict, lightdict)
+            view = (camdict is not None or lightdict is not None
+                    or obj.type in ('CAMERA', 'LIGHT'))
             obj.matrix_world = td_matrix_to_blender(vals, view)
             obj.keyframe_insert("location", frame=frame)
             obj.keyframe_insert("rotation_euler", frame=frame)

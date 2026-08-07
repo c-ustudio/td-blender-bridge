@@ -33,6 +33,20 @@ senders without them still work):
   local −Z as view direction). `fov` is horizontal, degrees.
 - `cam` absent ⇒ generic object, conjugated conversion (`M_b = C·M_td·C⁻¹`).
 
+### Lights
+
+```json
+{"t": "xform", "n": "TD_Light", "m": [16 floats],
+ "light": {"type": "cone", "dimmer": 1.0, "color": [1.0, 0.8, 0.6],
+           "angle": 40.0, "delta": 10.0}}
+```
+
+`light` present ⇒ the object is created/treated as a light (view-axis
+convention, like cameras). `type` point/cone/distant → POINT/SPOT/SUN;
+`dimmer` maps to watts heuristically (×1000, ×3 for sun — drive
+`data.energy` via the param path for exact control); `angle`/`delta`
+(degrees, cone only) → spot size/blend.
+
 ### Parameters
 
 ```json
