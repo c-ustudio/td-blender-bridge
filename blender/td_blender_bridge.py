@@ -411,8 +411,57 @@ def _step(holder, key):
         return holder[key]
 
 
+# node group pointer -> {socket name: (identifier, index in items_tree)}
+_GN_NAMES = {}
+
+
+def _gn_name_map(ng):
+    """Map every input socket name of a node group to its identifier.
+
+    The first socket wins when a group carries two inputs of the same name,
+    which Blender permits; a param_map cannot express the difference.
+    """
+    m = {}
+    for i, item in enumerate(ng.interface.items_tree):
+        # panels have neither in_out nor identifier
+        if getattr(item, "in_out", None) != 'INPUT':
+            continue
+        m.setdefault(item.name, (item.identifier, i))
+    return m
+
+
+def _gn_identifier(mod, name):
+    """Resolve a socket name to its identifier, or None if it is not one.
+
+    Cached per node group, because this runs for every mapped param on
+    every frame. A hit is revalidated in O(1) against the interface item
+    it came from, so renaming or removing an input rebuilds the map
+    instead of leaving a row driving a different socket.
+    """
+    ng = getattr(mod, "node_group", None)
+    if ng is None:
+        return None
+    ptr = ng.as_pointer()
+    cached = _GN_NAMES.get(ptr)
+    if cached is not None:
+        hit = cached.get(name)
+        if hit is not None:
+            ident, idx = hit
+            tree = ng.interface.items_tree
+            if idx < len(tree) and tree[idx].name == name                     and getattr(tree[idx], "identifier", None) == ident:
+                return ident
+    cached = _gn_name_map(ng)
+    _GN_NAMES[ptr] = cached
+    hit = cached.get(name)
+    return hit[0] if hit else None
+
+
 def _set_gn_input(obj, mod, key, value):
     """Write a Geometry Nodes modifier input. True if the key was a socket.
+
+    The key may be a socket identifier ("Socket_2") or the readable name
+    shown in the modifier panel ("Kick"); identifiers are tried first so
+    existing param_map rows keep their exact meaning.
 
     Blender 4.5+ moved modifier inputs behind ``properties.inputs``, where
     each entry is a group -- ``{"value": .., "type": .., "attribute_name": ..}``
@@ -423,20 +472,23 @@ def _set_gn_input(obj, mod, key, value):
     if getattr(mod, "type", None) != 'NODES':
         return False
     ins = getattr(getattr(mod, "properties", None), "inputs", None)
-    if ins is not None:                                     # Blender 4.5+
-        try:
-            grp = ins[key]
-        except (KeyError, TypeError):
+    holder = ins if ins is not None else mod       # 4.5+ : 4.2-4.4
+    try:
+        keys = holder.keys()
+    except TypeError:
+        return False
+    if key not in keys:
+        ident = _gn_identifier(mod, key)
+        if ident is None or ident not in keys:
             return False
+        key = ident
+    if ins is not None:
+        grp = holder[key]
         if not hasattr(grp, "get") or "value" not in grp.keys():
             return False                     # geometry socket: nothing to set
         grp["value"] = _fit(grp.get("value"), value)
-    else:                                                   # Blender 4.2-4.4
-        try:
-            cur = mod[key]
-        except (KeyError, TypeError):
-            return False
-        mod[key] = _fit(cur, value)
+    else:
+        holder[key] = _fit(holder[key], value)
     # writing a socket does not tag the object; without this the value
     # changes in the UI while the viewport stays frozen
     obj.update_tag()
@@ -1366,6 +1418,7 @@ def start_bridge(udp_port=9500, tcp_port=9501):
     stop_bridge()
     S.running = True
     S.last_error = ""
+    _GN_NAMES.clear()   # node groups may have been edited or reloaded
     try:
         S.udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         S.udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
