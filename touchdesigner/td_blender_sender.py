@@ -56,12 +56,16 @@ LIGHTS = {
     # 'light1': 'TD_Light',
 }
 
-# CHOP -> per-channel mapping to Blender object datapaths
-# channel name -> (blender object, datapath)
+# CHOP -> per-channel mapping to Blender object datapaths.
+# channel name -> (blender object, datapath), or a list of them when one
+# channel drives several things (an audio band feeding a node group input
+# and an emission strength, say).
 PARAM_CHOP = None         # e.g. 'params'
 PARAM_MAP = {
     # 'energy':   ('Light', 'data.energy'),
     # 'cube_sx':  ('Cube',  'scale'),        # scalar broadcast to vectors
+    # 'kick':     [('TV_Layout', 'modifiers.TDBridge.Kick'),
+    #              ('TV_Unit',   'modifiers.TDBridge.Emission')],
 }
 
 # point clouds: op -> Blender object name.
@@ -231,6 +235,14 @@ def send_light(td_path, bl_name):
                     'm': _matrix16(lt.worldTransform), 'light': d})
 
 
+def _param_targets(name):
+    """The (object, datapath) pairs a channel drives; may be several."""
+    t = PARAM_MAP.get(name)
+    if not t:
+        return ()
+    return t if isinstance(t, list) else (t,)
+
+
 def send_params():
     if not PARAM_CHOP:
         return
@@ -239,9 +251,9 @@ def send_params():
         return
     batch = []
     for ch in chop.chans():
-        target = PARAM_MAP.get(ch.name)
-        if target:
-            batch.append([target[0], target[1], float(ch[0])])
+        v = float(ch[0])
+        for ob, path in _param_targets(ch.name):
+            batch.append([ob, path, v])
     if batch:
         _net.send_json({'t': 'params', 'd': batch})
 

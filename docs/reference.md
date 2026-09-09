@@ -58,6 +58,10 @@ mix      │ Cube      │ scale
 roughn   │ Suzanne   │ active_material.node_tree.nodes["Principled BSDF"].inputs["Roughness"].default_value
 ```
 
+One channel may appear in several rows, and drives every one of them —
+an audio band can feed a node group input, an emission strength and a
+light at once without duplicating the channel in TouchDesigner.
+
 ### Geometry Nodes inputs
 
 A node group input is addressed through the modifier, by the name shown
