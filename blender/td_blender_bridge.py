@@ -390,6 +390,59 @@ def _apply_camera_props(obj, camdict):
         cam.clip_end = camdict["far"]
 
 
+def _fit(cur, value):
+    """Broadcast a scalar into a vector/colour slot of the same width."""
+    if cur is not None and hasattr(cur, "__len__") and not hasattr(value, "__len__"):
+        return [value] * len(cur)
+    return value
+
+
+def _step(holder, key):
+    """One hop along a datapath: index, then attribute, then mapping key.
+
+    The mapping fallback is what reaches collection members such as
+    ``modifiers["TDBridge"]``, which getattr alone cannot.
+    """
+    if key.isdigit():
+        return holder[int(key)]
+    try:
+        return getattr(holder, key)
+    except AttributeError:
+        return holder[key]
+
+
+def _set_gn_input(obj, mod, key, value):
+    """Write a Geometry Nodes modifier input. True if the key was a socket.
+
+    Blender 4.5+ moved modifier inputs behind ``properties.inputs``, where
+    each entry is a group -- ``{"value": .., "type": .., "attribute_name": ..}``
+    -- and assigning over the group instead of its "value" member leaves the
+    socket structurally broken and silently ignored by evaluation. Older
+    builds keep the value as a plain IDProperty on the modifier itself.
+    """
+    if getattr(mod, "type", None) != 'NODES':
+        return False
+    ins = getattr(getattr(mod, "properties", None), "inputs", None)
+    if ins is not None:                                     # Blender 4.5+
+        try:
+            grp = ins[key]
+        except (KeyError, TypeError):
+            return False
+        if not hasattr(grp, "get") or "value" not in grp.keys():
+            return False                     # geometry socket: nothing to set
+        grp["value"] = _fit(grp.get("value"), value)
+    else:                                                   # Blender 4.2-4.4
+        try:
+            cur = mod[key]
+        except (KeyError, TypeError):
+            return False
+        mod[key] = _fit(cur, value)
+    # writing a socket does not tag the object; without this the value
+    # changes in the UI while the viewport stays frozen
+    obj.update_tag()
+    return True
+
+
 def _set_param(name, path, value):
     obj = bpy.data.objects.get(name)
     if obj is None:
@@ -398,17 +451,25 @@ def _set_param(name, path, value):
     parts = path.split(".")
     try:
         for p in parts[:-1]:
-            holder = holder[int(p)] if p.isdigit() else getattr(holder, p)
+            holder = _step(holder, p)
         last = parts[-1]
+        if _set_gn_input(obj, holder, last, value):
+            return
         if last.isdigit():
             holder[int(last)] = value
-        else:
+        elif hasattr(holder, last):
             cur = getattr(holder, last)
             # allow scalar broadcast into vectors/colors
-            if hasattr(cur, "__len__") and not hasattr(value, "__len__"):
-                setattr(holder, last, [value] * len(cur))
-            else:
-                setattr(holder, last, value)
+            setattr(holder, last, _fit(cur, value))
+        else:
+            # an existing custom property; a path that matches nothing is a
+            # param_map typo and must surface rather than quietly define one
+            try:
+                holder[last]
+            except (KeyError, TypeError):
+                raise KeyError("no attribute or property %r" % last)
+            holder[last] = value
+            obj.update_tag()
     except Exception as e:
         S.last_error = f"param {name}.{path}: {e}"
 

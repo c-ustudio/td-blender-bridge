@@ -35,3 +35,6 @@ jobs:
       - name: Smoke test (headless bridge round trip)
         run: |
           ./blender-4.2.0-linux-x64/blender -b --factory-startup --python tests/smoke.py
+      - name: Param routing (GN sockets + RNA paths)
+        run: |
+          ./blender-4.2.0-linux-x64/blender -b --factory-startup --python tests/params.py
