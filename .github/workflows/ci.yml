@@ -16,6 +16,9 @@ jobs:
       - run: pip install ruff
       - run: ruff check blender touchdesigner tools tests
       - run: python tools/build_extension.py
+      # the sculpture layouts must stay equal-length and stable-ordered so
+      # any pair interpolates; the self-check asserts it, no Blender needed
+      - run: python scenes/layout_gen.py
 
   blender-smoke:
     runs-on: ubuntu-latest
