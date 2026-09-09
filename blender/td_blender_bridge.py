@@ -397,14 +397,62 @@ def _fit(cur, value):
     return value
 
 
+def _parse_path(path):
+    """Split a datapath into lookup steps: str for a name, int for an index.
+
+    Dots separate steps, and a bracket subscript is a step of its own, so
+    both spellings of an index work and quoted keys may contain dots::
+
+        rotation_euler.2
+        modifiers.TDBridge.Kick
+        active_material.node_tree.nodes["Principled BSDF"].inputs[2].default_value
+    """
+    steps = []
+    buf = ""
+    i = 0
+    while i < len(path):
+        c = path[i]
+        if c == "[":
+            j = path.find("]", i)
+            if j < 0:
+                raise ValueError("unclosed '[' in %r" % path)
+            if buf:
+                steps.append(buf)
+                buf = ""
+            key = path[i + 1:j].strip()
+            if len(key) > 1 and key[0] in "'\"" and key[-1] == key[0]:
+                steps.append(key[1:-1])
+            else:
+                steps.append(int(key))
+            i = j + 1
+            if i < len(path) and path[i] == ".":
+                i += 1
+            continue
+        if c == ".":
+            if buf:
+                steps.append(buf)
+                buf = ""
+            i += 1
+            continue
+        buf += c
+        i += 1
+    if buf:
+        steps.append(buf)
+    if not steps:
+        raise ValueError("empty datapath")
+    # a bare numeric segment is an index, as in rotation_euler.2
+    return [int(s) if isinstance(s, str) and s.isdigit() else s for s in steps]
+
+
 def _step(holder, key):
     """One hop along a datapath: index, then attribute, then mapping key.
 
     The mapping fallback is what reaches collection members such as
-    ``modifiers["TDBridge"]``, which getattr alone cannot.
+    ``modifiers["TDBridge"]`` and ``nodes["Principled BSDF"]``, which
+    getattr alone cannot.
     """
-    if key.isdigit():
-        return holder[int(key)]
+    if isinstance(key, int):
+        return holder[key]
     try:
         return getattr(holder, key)
     except AttributeError:
@@ -500,15 +548,15 @@ def _set_param(name, path, value):
     if obj is None:
         return
     holder = obj
-    parts = path.split(".")
     try:
-        for p in parts[:-1]:
+        steps = _parse_path(path)
+        for p in steps[:-1]:
             holder = _step(holder, p)
-        last = parts[-1]
-        if _set_gn_input(obj, holder, last, value):
+        last = steps[-1]
+        if isinstance(last, int):
+            holder[last] = value
+        elif _set_gn_input(obj, holder, last, value):
             return
-        if last.isdigit():
-            holder[int(last)] = value
         elif hasattr(holder, last):
             cur = getattr(holder, last)
             # allow scalar broadcast into vectors/colors

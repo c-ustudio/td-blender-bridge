@@ -174,6 +174,46 @@ try:
     check(err == "" and abs(mean_z(obj) - 0.75) < 1e-4,
           "renaming back resolves again")
 
+    print("bracket subscripts in a datapath")
+    mat = bpy.data.materials.new("TDB_TestMat")
+    mat.use_nodes = True
+    obj.data.materials.append(mat)
+    bsdf = next(n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED')
+    bsdf.name = "Principled BSDF"
+    err = set_param(
+        obj,
+        'active_material.node_tree.nodes["Principled BSDF"]'
+        '.inputs["Roughness"].default_value', 0.33)
+    check(err == "" and abs(bsdf.inputs["Roughness"].default_value - 0.33) < 1e-6,
+          "the documented material-node example works (%s)" % (err or "none"))
+    err = set_param(
+        obj,
+        'active_material.node_tree.nodes["Principled BSDF"].inputs[2]'
+        '.default_value', 0.66)
+    check(err == "" and abs(bsdf.inputs[2].default_value - 0.66) < 1e-6,
+          "the same socket by index (%s)" % (err or "none"))
+
+    # a quoted key may contain dots, which a plain split would tear apart
+    mix = mat.node_tree.nodes.new('ShaderNodeMix')
+    mix.name = "Mix.001"
+    err = set_param(
+        obj,
+        'active_material.node_tree.nodes["Mix.001"].inputs[0].default_value',
+        0.7)
+    check(err == "" and abs(mix.inputs[0].default_value - 0.7) < 1e-6,
+          "a quoted key containing a dot (%s)" % (err or "none"))
+
+    err = set_param(obj, "rotation_euler[1]", 0.5)
+    check(err == "" and abs(obj.rotation_euler[1] - 0.5) < 1e-6,
+          "bracket index equals the dotted form (%s)" % (err or "none"))
+
+    err = set_param(obj, 'modifiers["TDBridge"]["Kick"]', 1.75)
+    check(err == "" and abs(mean_z(obj) - 1.75) < 1e-4,
+          "fully bracketed GN socket path (%s)" % (err or "none"))
+
+    err = set_param(obj, "active_material.node_tree.nodes[\"Nope\"].x", 1.0)
+    check(err != "", "a missing node reports rather than raises")
+
 except Exception:
     traceback.print_exc()
     FAILED.append("unhandled exception")

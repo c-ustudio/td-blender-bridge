@@ -45,16 +45,45 @@ TouchDesigner Bridge add-on (Blender). Wire format: [protocol.md](protocol.md).
 
 ### param_map table (channel → Blender property)
 
-Rows: `channel │ object │ datapath`. Any animatable property works;
-integer segments index into collections; scalars broadcast into vectors.
+Rows: `channel │ object │ datapath`. The datapath is walked from the
+object. Dots separate steps; a step may be an attribute, a collection
+member, an index (`rotation_euler.2` or `rotation_euler[1]`), or a
+quoted key (`nodes["Mix.001"]` — quoted keys may contain dots). A
+single scalar broadcasts into a vector or colour of any width.
 
 ```
-energy   │ Light    │ data.energy
-sunrot   │ Sun      │ rotation_euler.2
-roughn   │ Suzanne  │ active_material.node_tree.nodes["Principled BSDF"].inputs[2].default_value
-strength │ World    │ (use a param on a world-driving object, or drive TD_Tex instead)
-mix      │ Cube     │ scale
+energy   │ Light     │ data.energy
+sunrot   │ Sun       │ rotation_euler.2
+mix      │ Cube      │ scale
+roughn   │ Suzanne   │ active_material.node_tree.nodes["Principled BSDF"].inputs["Roughness"].default_value
 ```
+
+### Geometry Nodes inputs
+
+A node group input is addressed through the modifier, by the name shown
+in the modifier panel or by its socket identifier:
+
+```
+kick     │ TV_Layout │ modifiers.TDBridge.Kick
+kick     │ TV_Layout │ modifiers.TDBridge.Socket_2
+emission │ TV_Layout │ modifiers["TDBridge"]["Emission"]
+```
+
+Names are the readable choice and survive reordering the group's inputs;
+they break, loudly, if the input is renamed. Identifiers survive renaming
+too but say nothing about what they drive. Either way the write is tagged
+for re-evaluation, so the viewport follows the value.
+
+The same row also reaches ordinary modifier properties
+(`modifiers.TDBridge.show_viewport`) — socket keys are matched first.
+
+### Custom properties
+
+`td_gain │ Cube │ td_gain` writes an object custom property, which a
+driver can then read. The property must already exist: a datapath that
+matches no attribute and no existing property is reported in the N-panel
+rather than quietly defining a new one, so a mistyped row is visible
+instead of silent.
 
 Values apply live (see them in Blender's panel) and bake to keyframes
 with Record.
